@@ -44,10 +44,30 @@ async function main() {
 
   // Check if we should run immediately (for testing) or schedule
   const runNow = process.argv.includes('--now') || process.argv.includes('-n');
+  // TRIGGER_POST_INDEX: 0=9:00, 1=12:00, 2=15:00, 3=18:00, 4=21:00
+  const triggerPostIndex = process.env.TRIGGER_POST_INDEX ? parseInt(process.env.TRIGGER_POST_INDEX, 10) : null;
 
   if (runNow) {
     console.log('\nRunning immediately (--now flag detected)...\n');
     await prepareAndPostAll();
+  } else if (triggerPostIndex !== null) {
+    console.log(`\n[TRIGGER] TRIGGER_POST_INDEX=${triggerPostIndex} detected`);
+    console.log(`[TRIGGER] Will post character at slot ${triggerPostIndex} (${POST_TIMES[triggerPostIndex]?.hour}:00)\n`);
+    
+    await preparePostsForToday();
+    
+    if (todaysPosts.length > triggerPostIndex) {
+      const post = todaysPosts[triggerPostIndex];
+      console.log(`\n[TRIGGER] Posting: ${post.character.name} (${post.character.series})`);
+      console.log(`[TRIGGER] Birthday: ${post.character.birthday}`);
+      console.log(`[TRIGGER] Image: ${post.imagePath}`);
+      await postSingleBirthday(post);
+      console.log('[TRIGGER] Post complete. Exiting...');
+      process.exit(0);
+    } else {
+      console.log(`[TRIGGER] No post available at index ${triggerPostIndex}. Only ${todaysPosts.length} posts prepared.`);
+      process.exit(1);
+    }
   } else {
     // Schedule daily preparation
     scheduleDailyPrep(preparePostsForToday);
@@ -131,44 +151,66 @@ async function preparePostsWithImages(characters) {
 
   for (const char of characters) {
     console.log(`\nPreparing post for ${char.name}...`);
+    console.log(`  [DEBUG] Character data: name="${char.name}", series="${char.series}", birthday="${char.birthday}", thumbnail="${char.thumbnail}"`);
 
     try {
       // Search for character on MAL via Jikan
+      console.log(`  [DEBUG] Searching MAL for "${char.name}" in "${char.series}"...`);
       const malChar = await searchCharacter(char.name, char.series);
+
+      if (malChar) {
+        console.log(`  [DEBUG] MAL result: name="${malChar.name}", image="${malChar.image}", image_large="${malChar.image_large}"`);
+      } else {
+        console.log(`  [DEBUG] MAL search returned null`);
+      }
 
       let imagePath = null;
 
       if (malChar && malChar.image_large) {
         // Download the image
+        const imageUrl = malChar.image_large || malChar.image;
         const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}.jpg`);
-        imagePath = await downloadImage(malChar.image_large || malChar.image, imageFile);
+        console.log(`  [DEBUG] Attempting to download MAL image: ${imageUrl}`);
+        console.log(`  [DEBUG] Target path: ${imageFile}`);
+        
+        imagePath = await downloadImage(imageUrl, imageFile);
 
         if (imagePath) {
           console.log(`  Downloaded image from MAL`);
+        } else {
+          console.log(`  [DEBUG] MAL image download returned null`);
         }
       }
 
       // Fallback to database thumbnail
       if (!imagePath && char.thumbnail) {
         const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_thumb.jpg`);
+        console.log(`  [DEBUG] Attempting fallback thumbnail: ${char.thumbnail}`);
+        console.log(`  [DEBUG] Target path: ${imageFile}`);
+        
         imagePath = await downloadImage(char.thumbnail, imageFile);
 
         if (imagePath) {
           console.log(`  Downloaded thumbnail from database`);
+        } else {
+          console.log(`  [DEBUG] Thumbnail download also returned null`);
         }
       }
 
       if (!imagePath) {
-        console.log(`  No image available, skipping...`);
+        console.log(`  [WARN] No image available for ${char.name}, skipping...`);
         continue;
       }
+      
+      console.log(`  [DEBUG] Final image path: ${imagePath}`);
 
       posts.push({
         character: {
           name: malChar?.name || char.name,
           name_kanji: malChar?.name_kanji || null,
           series: char.series,
-          favorites: malChar?.favorites || char.favorites
+          favorites: malChar?.favorites || char.favorites,
+          birthday: char.birthday
         },
         imagePath
       });

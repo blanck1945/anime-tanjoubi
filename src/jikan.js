@@ -152,20 +152,40 @@ export async function getCharacterPictures(malId) {
  */
 export async function downloadImage(imageUrl, outputPath) {
   try {
+    console.log(`  [DEBUG] downloadImage() called with URL: ${imageUrl}`);
+    
+    if (!imageUrl) {
+      console.log(`  [DEBUG] downloadImage() - imageUrl is empty/null`);
+      return null;
+    }
+    
     const response = await axios.get(imageUrl, {
       responseType: 'arraybuffer',
+      timeout: 30000, // 30 second timeout
       headers: {
         'User-Agent': 'AnimeBirthdayBot/1.0',
         'Referer': 'https://myanimelist.net/'
       }
     });
 
+    console.log(`  [DEBUG] downloadImage() - Response status: ${response.status}, size: ${response.data?.length || 0} bytes`);
+
     const fs = await import('fs/promises');
     await fs.writeFile(outputPath, response.data);
+    
+    // Verify file was written
+    const stats = await fs.stat(outputPath);
+    console.log(`  [DEBUG] downloadImage() - File written successfully, size: ${stats.size} bytes`);
 
     return outputPath;
   } catch (error) {
-    console.error(`Error downloading image from ${imageUrl}:`, error.message);
+    console.error(`[ERROR] downloadImage() failed for ${imageUrl}:`, error.message);
+    if (error.response) {
+      console.error(`  [ERROR] Response status: ${error.response.status}`);
+    }
+    if (error.code) {
+      console.error(`  [ERROR] Error code: ${error.code}`);
+    }
     return null;
   }
 }
