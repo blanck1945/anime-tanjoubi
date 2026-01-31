@@ -69,12 +69,15 @@ export async function searchCharacter(characterName, animeName = null) {
       bestMatch = data.data[0];
     }
 
+    const image = bestMatch.images?.jpg?.image_url || bestMatch.images?.webp?.image_url || null;
+    const imageLarge = bestMatch.images?.jpg?.large_image_url || bestMatch.images?.webp?.large_image_url || null;
+    
     return {
       mal_id: bestMatch.mal_id,
       name: bestMatch.name,
       name_kanji: bestMatch.name_kanji,
-      image: bestMatch.images?.jpg?.image_url || bestMatch.images?.webp?.image_url,
-      image_large: bestMatch.images?.jpg?.large_image_url || bestMatch.images?.webp?.large_image_url,
+      image: image,
+      image_large: imageLarge,
       url: bestMatch.url,
       favorites: bestMatch.favorites || 0
     };

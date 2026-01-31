@@ -166,24 +166,32 @@ async function preparePostsWithImages(characters) {
 
       let imagePath = null;
 
-      if (malChar && malChar.image_large) {
-        // Download the image
-        const imageUrl = malChar.image_large || malChar.image;
+      // Try MAL image (prefer large, fallback to regular)
+      const malImageUrl = malChar?.image_large || malChar?.image;
+      if (malImageUrl && malImageUrl !== 'undefined') {
         const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}.jpg`);
-        console.log(`  [DEBUG] Attempting to download MAL image: ${imageUrl}`);
+        console.log(`  [DEBUG] Attempting to download MAL image: ${malImageUrl}`);
         console.log(`  [DEBUG] Target path: ${imageFile}`);
         
-        imagePath = await downloadImage(imageUrl, imageFile);
+        imagePath = await downloadImage(malImageUrl, imageFile);
 
         if (imagePath) {
-          console.log(`  Downloaded image from MAL`);
+          // Verify file size is reasonable (> 1KB to filter out placeholder images)
+          const stats = await fs.stat(imagePath);
+          if (stats.size > 1000) {
+            console.log(`  Downloaded image from MAL (${stats.size} bytes)`);
+          } else {
+            console.log(`  [DEBUG] MAL image too small (${stats.size} bytes), likely placeholder`);
+            await fs.unlink(imagePath);
+            imagePath = null;
+          }
         } else {
           console.log(`  [DEBUG] MAL image download returned null`);
         }
       }
 
-      // Fallback to database thumbnail
-      if (!imagePath && char.thumbnail) {
+      // Fallback to database thumbnail (but verify it's not the default placeholder)
+      if (!imagePath && char.thumbnail && !char.thumbnail.includes('forum/67712-596211384')) {
         const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_thumb.jpg`);
         console.log(`  [DEBUG] Attempting fallback thumbnail: ${char.thumbnail}`);
         console.log(`  [DEBUG] Target path: ${imageFile}`);
@@ -191,10 +199,19 @@ async function preparePostsWithImages(characters) {
         imagePath = await downloadImage(char.thumbnail, imageFile);
 
         if (imagePath) {
-          console.log(`  Downloaded thumbnail from database`);
+          const stats = await fs.stat(imagePath);
+          if (stats.size > 1000) {
+            console.log(`  Downloaded thumbnail from database (${stats.size} bytes)`);
+          } else {
+            console.log(`  [DEBUG] Thumbnail too small (${stats.size} bytes), likely placeholder`);
+            await fs.unlink(imagePath);
+            imagePath = null;
+          }
         } else {
           console.log(`  [DEBUG] Thumbnail download also returned null`);
         }
+      } else if (!imagePath) {
+        console.log(`  [DEBUG] Skipping fallback thumbnail - is default placeholder`);
       }
 
       if (!imagePath) {
