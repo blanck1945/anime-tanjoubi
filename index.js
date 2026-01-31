@@ -166,44 +166,62 @@ async function preparePostsWithImages(characters) {
 
       let imagePath = null;
 
-      // Try MAL image (prefer large, fallback to regular)
-      const malImageUrl = malChar?.image_large || malChar?.image;
-      if (malImageUrl && malImageUrl !== 'undefined') {
-        const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}.jpg`);
-        console.log(`  [DEBUG] Attempting to download MAL image: ${malImageUrl}`);
-        console.log(`  [DEBUG] Target path: ${imageFile}`);
+      // Priority 1: Try ACDB full image (from character page)
+      if (char.image) {
+        const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_acdb.jpg`);
+        console.log(`  [DEBUG] Attempting ACDB image: ${char.image}`);
         
-        imagePath = await downloadImage(malImageUrl, imageFile);
+        imagePath = await downloadImage(char.image, imageFile);
 
         if (imagePath) {
-          // Verify file size is reasonable (> 1KB to filter out placeholder images)
           const stats = await fs.stat(imagePath);
-          if (stats.size > 1000) {
-            console.log(`  Downloaded image from MAL (${stats.size} bytes)`);
+          if (stats.size > 5000) { // ACDB images should be decent size
+            console.log(`  Downloaded image from ACDB (${stats.size} bytes)`);
           } else {
-            console.log(`  [DEBUG] MAL image too small (${stats.size} bytes), likely placeholder`);
+            console.log(`  [DEBUG] ACDB image too small (${stats.size} bytes)`);
             await fs.unlink(imagePath);
             imagePath = null;
           }
-        } else {
-          console.log(`  [DEBUG] MAL image download returned null`);
         }
       }
 
-      // Fallback to database thumbnail (but verify it's not the default placeholder)
+      // Priority 2: Try MAL image (prefer large, fallback to regular)
+      if (!imagePath) {
+        const malImageUrl = malChar?.image_large || malChar?.image;
+        if (malImageUrl && malImageUrl !== 'undefined') {
+          const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_mal.jpg`);
+          console.log(`  [DEBUG] Attempting MAL image: ${malImageUrl}`);
+          
+          imagePath = await downloadImage(malImageUrl, imageFile);
+
+          if (imagePath) {
+            const stats = await fs.stat(imagePath);
+            if (stats.size > 1000) {
+              console.log(`  Downloaded image from MAL (${stats.size} bytes)`);
+            } else {
+              console.log(`  [DEBUG] MAL image too small (${stats.size} bytes)`);
+              await fs.unlink(imagePath);
+              imagePath = null;
+            }
+          } else {
+            console.log(`  [DEBUG] MAL image download returned null`);
+          }
+        }
+      }
+
+      // Priority 3: Fallback to ACDB thumbnail (but verify it's not the default placeholder)
       if (!imagePath && char.thumbnail && !char.thumbnail.includes('forum/67712-596211384')) {
         const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_thumb.jpg`);
-        console.log(`  [DEBUG] Attempting fallback thumbnail: ${char.thumbnail}`);
-        console.log(`  [DEBUG] Target path: ${imageFile}`);
+        console.log(`  [DEBUG] Attempting ACDB thumbnail: ${char.thumbnail}`);
         
         imagePath = await downloadImage(char.thumbnail, imageFile);
 
         if (imagePath) {
           const stats = await fs.stat(imagePath);
           if (stats.size > 1000) {
-            console.log(`  Downloaded thumbnail from database (${stats.size} bytes)`);
+            console.log(`  Downloaded thumbnail from ACDB (${stats.size} bytes)`);
           } else {
-            console.log(`  [DEBUG] Thumbnail too small (${stats.size} bytes), likely placeholder`);
+            console.log(`  [DEBUG] Thumbnail too small (${stats.size} bytes)`);
             await fs.unlink(imagePath);
             imagePath = null;
           }
@@ -211,7 +229,7 @@ async function preparePostsWithImages(characters) {
           console.log(`  [DEBUG] Thumbnail download also returned null`);
         }
       } else if (!imagePath) {
-        console.log(`  [DEBUG] Skipping fallback thumbnail - is default placeholder`);
+        console.log(`  [DEBUG] No valid image source available`);
       }
 
       if (!imagePath) {

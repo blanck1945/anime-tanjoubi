@@ -116,6 +116,36 @@ async function getCharacterDetails(charId) {
       }
     }
 
+    // Extract character image - look for main character image
+    let image = null;
+    
+    // Try to find the main character image (usually in a specific container or as main img)
+    $('img').each((i, elem) => {
+      const src = $(elem).attr('src') || $(elem).attr('data-src') || '';
+      // Look for character images in uploads/chars/ (not thumbs, not icons)
+      if (src.includes('uploads/chars/') && !src.includes('thumbs/') && !src.includes('icons')) {
+        image = src.startsWith('http') ? src : `https://ami.animecharactersdatabase.com${src}`;
+        return false; // Break loop
+      }
+    });
+    
+    // If no full image found, try to find a thumb and convert to full URL
+    if (!image) {
+      $('img').each((i, elem) => {
+        const src = $(elem).attr('src') || $(elem).attr('data-src') || '';
+        if (src.includes('uploads/chars/thumbs/')) {
+          // Convert thumb URL to full image URL
+          // From: .../uploads/chars/thumbs/200/1234-567.jpg
+          // To:   .../uploads/chars/1234-567.jpg
+          const fullUrl = src.replace('/thumbs/200/', '/').replace('/thumbs/', '/');
+          image = fullUrl.startsWith('http') ? fullUrl : `https://ami.animecharactersdatabase.com${fullUrl}`;
+          return false;
+        }
+      });
+    }
+    
+    console.log(`  [DEBUG] ACDB image for ${cleanName(name)}: ${image || 'not found'}`);
+
     // Extract favorites/popularity
     let favorites = 0;
     const pageText = $('body').text();
@@ -131,7 +161,8 @@ async function getCharacterDetails(charId) {
       name: cleanName(name),
       series: series || 'Unknown Anime',
       favorites,
-      birthday
+      birthday,
+      image // Add image from ACDB
     };
   } catch (error) {
     console.error(`Error getting details for character ${charId}:`, error.message);
