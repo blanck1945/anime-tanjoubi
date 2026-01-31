@@ -36,7 +36,7 @@ export async function searchCharacter(characterName, animeName = null) {
     // Clean up the search query
     const query = characterName.replace(/[^\w\s]/g, ' ').trim();
 
-    const data = await jikanRequest(`/characters?q=${encodeURIComponent(query)}&limit=10`);
+    const data = await jikanRequest(`/characters?q=${encodeURIComponent(query)}&limit=25`);
 
     if (!data.data || data.data.length === 0) {
       console.log(`No results found for "${characterName}"`);
@@ -47,14 +47,24 @@ export async function searchCharacter(characterName, animeName = null) {
 
     // If we have an anime name, try to match it
     if (animeName) {
-      const animeClean = animeName.toLowerCase().replace(/[^\w\s]/g, '');
+      // Extract keywords from anime name (ignore common words)
+      const animeKeywords = animeName
+        .toLowerCase()
+        .replace(/[^\w\s]/g, '')
+        .split(/\s+/)
+        .filter(word => word.length > 2 && !['the', 'no', 'ni', 'wa', 'ga', 'de', 'to'].includes(word));
+      
+      console.log(`  [DEBUG] Searching for anime keywords: ${animeKeywords.join(', ')}`);
 
       for (const char of data.data) {
         // Check if character appears in the specified anime
         if (char.anime && char.anime.length > 0) {
           for (const anime of char.anime) {
             const title = (anime.anime?.title || '').toLowerCase();
-            if (title.includes(animeClean) || animeClean.includes(title)) {
+            // Check if any keyword matches
+            const keywordMatch = animeKeywords.some(keyword => title.includes(keyword));
+            if (keywordMatch) {
+              console.log(`  [DEBUG] Found match: "${char.name}" in "${anime.anime?.title}"`);
               bestMatch = char;
               break;
             }
@@ -62,10 +72,23 @@ export async function searchCharacter(characterName, animeName = null) {
         }
         if (bestMatch) break;
       }
+      
+      // If still no match, try searching with anime name included
+      if (!bestMatch) {
+        console.log(`  [DEBUG] No match found, trying search with anime name...`);
+        const combinedQuery = `${characterName} ${animeName}`.replace(/[^\w\s]/g, ' ').trim();
+        const data2 = await jikanRequest(`/characters?q=${encodeURIComponent(combinedQuery)}&limit=5`);
+        
+        if (data2.data && data2.data.length > 0) {
+          bestMatch = data2.data[0];
+          console.log(`  [DEBUG] Combined search found: "${bestMatch.name}"`);
+        }
+      }
     }
 
     // If no anime match, use the first result (usually most popular)
     if (!bestMatch) {
+      console.log(`  [DEBUG] Using first result as fallback: "${data.data[0].name}"`);
       bestMatch = data.data[0];
     }
 
