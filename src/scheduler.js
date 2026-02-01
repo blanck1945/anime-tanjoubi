@@ -109,8 +109,8 @@ export function schedulePost(post, time, postCallback) {
 function getNextTimeInTimezone(hour, minute, timezone) {
   const now = new Date();
 
-  // Create a date string for today at the specified time
-  const dateStr = now.toLocaleDateString('en-CA'); // YYYY-MM-DD format
+  // Create a date string for today at the specified time (in Argentina timezone)
+  const dateStr = now.toLocaleDateString('en-CA', { timeZone: timezone }); // YYYY-MM-DD format
   const timeStr = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}:00`;
 
   // Create date in the target timezone
