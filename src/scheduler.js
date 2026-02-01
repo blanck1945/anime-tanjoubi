@@ -9,7 +9,7 @@ export const POST_TIMES = [
   { hour: 12, minute: 0 },  // 12:00 PM
   { hour: 15, minute: 0 },  // 3:00 PM
   { hour: 18, minute: 0 },  // 6:00 PM
-  { hour: 22, minute: 25 }  // 10:25 PM (temporary)
+  { hour: 21, minute: 0 }   // 9:00 PM
 ];
 
 // Time to prepare posts (run scraper and download images)
