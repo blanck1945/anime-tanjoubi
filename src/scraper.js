@@ -118,25 +118,40 @@ async function getCharacterDetails(charId) {
 
     // Extract character image - look for main character image
     let image = null;
-    
-    // Try to find the main character image (usually in a specific container or as main img)
+
+    // Priority 1: Look for full-size images in uploads/ (not thumbs, not icons, not chars/thumbs)
     $('img').each((i, elem) => {
       const src = $(elem).attr('src') || $(elem).attr('data-src') || '';
-      // Look for character images in uploads/chars/ (not thumbs, not icons)
-      if (src.includes('uploads/chars/') && !src.includes('thumbs/') && !src.includes('icons')) {
+      // Match uploads/*.jpg but NOT uploads/thumbs/ or uploads/chars/thumbs/
+      if (src.includes('/uploads/') && !src.includes('/thumbs/') && !src.includes('/icons/') && src.match(/uploads\/[\d]+-[\d]+\.(jpg|png|gif)/i)) {
         image = src.startsWith('http') ? src : `https://ami.animecharactersdatabase.com${src}`;
         return false; // Break loop
       }
     });
-    
-    // If no full image found, try to find a thumb and convert to full URL
+
+    // Priority 2: Try uploads/chars/ full images
     if (!image) {
       $('img').each((i, elem) => {
         const src = $(elem).attr('src') || $(elem).attr('data-src') || '';
+        if (src.includes('uploads/chars/') && !src.includes('thumbs/') && !src.includes('icons')) {
+          image = src.startsWith('http') ? src : `https://ami.animecharactersdatabase.com${src}`;
+          return false;
+        }
+      });
+    }
+
+    // Priority 3: Convert thumb URL to full image URL
+    if (!image) {
+      $('img').each((i, elem) => {
+        const src = $(elem).attr('src') || $(elem).attr('data-src') || '';
+        if (src.includes('/uploads/thumbs/') && src.match(/[\d]+-[\d]+\.(jpg|png|gif)/i)) {
+          // From: .../uploads/thumbs/1234-567.jpg -> .../uploads/1234-567.jpg
+          const fullUrl = src.replace('/uploads/thumbs/', '/uploads/');
+          image = fullUrl.startsWith('http') ? fullUrl : `https://ami.animecharactersdatabase.com${fullUrl}`;
+          return false;
+        }
         if (src.includes('uploads/chars/thumbs/')) {
-          // Convert thumb URL to full image URL
-          // From: .../uploads/chars/thumbs/200/1234-567.jpg
-          // To:   .../uploads/chars/1234-567.jpg
+          // From: .../uploads/chars/thumbs/200/1234-567.jpg -> .../uploads/chars/1234-567.jpg
           const fullUrl = src.replace('/thumbs/200/', '/').replace('/thumbs/', '/');
           image = fullUrl.startsWith('http') ? fullUrl : `https://ami.animecharactersdatabase.com${fullUrl}`;
           return false;
