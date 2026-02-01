@@ -73,10 +73,11 @@ async function main() {
     scheduleDailyPrep(preparePostsForToday);
 
     // Check if we should prepare now (if it's after prep time but before last post time)
+    // Use Argentina timezone for the check
     const now = new Date();
-    const hour = now.getHours();
+    const argentinaHour = parseInt(now.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires', hour: 'numeric', hour12: false }));
 
-    if (hour >= 8 && hour < 22) {
+    if (argentinaHour >= 8 && argentinaHour < 22) {
       console.log('\nPreparing posts for today...\n');
       await preparePostsForToday();
     }
