@@ -52,9 +52,10 @@ export async function getTodaysBirthdays(limit = 5) {
     // Remove duplicates by ID
     const uniqueChars = [...new Map(characters.map(c => [c.id, c])).values()];
 
-    // Get detailed info for each character
+    // Get detailed info for more characters to sort by favorites
+    const charsToProcess = 25; // Process more to find the most popular ones
     const detailedChars = [];
-    for (const char of uniqueChars.slice(0, limit * 2)) { // Fetch extra in case some fail
+    for (const char of uniqueChars.slice(0, charsToProcess)) {
       try {
         const details = await getCharacterDetails(char.id);
         if (details) {
@@ -68,9 +69,13 @@ export async function getTodaysBirthdays(limit = 5) {
       } catch (e) {
         console.error(`Failed to get details for ${char.name}:`, e.message);
       }
-
-      if (detailedChars.length >= limit) break;
     }
+
+    // Sort by favorites (most popular first)
+    detailedChars.sort((a, b) => b.favorites - a.favorites);
+
+    console.log(`[DEBUG] Top ${limit} characters by favorites:`,
+      detailedChars.slice(0, limit).map(c => `${c.name} (${c.favorites} favs)`).join(', '));
 
     return detailedChars.slice(0, limit);
   } catch (error) {
