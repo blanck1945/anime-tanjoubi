@@ -338,7 +338,7 @@ export function startServer() {
     }
   });
 
-  server.listen(PORT, () => {
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`Dashboard server running at http://localhost:${PORT}`);
     console.log(`API endpoint: http://localhost:${PORT}/api/status`);
   });
