@@ -8,6 +8,8 @@ import { searchCharacter, getCharacterPictures, downloadImage } from './src/jika
 import { initTwitterClient, postBirthdayTweet } from './src/twitter.js';
 import { scheduleDailyPrep, schedulePosts, getScheduledJobs, POST_TIMES } from './src/scheduler.js';
 import { logUsageSummary } from './src/usage-tracker.js';
+import { initializeTodaysState, cleanupOldStateFiles } from './src/state.js';
+import { startServer } from './src/server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,6 +44,12 @@ async function main() {
   // Ensure temp directory exists
   await fs.mkdir(TEMP_DIR, { recursive: true });
 
+  // Clean up old state files (keep last 7 days)
+  await cleanupOldStateFiles();
+
+  // Start the dashboard server
+  startServer();
+
   // Check if we should run immediately (for testing) or schedule
   const runNow = process.argv.includes('--now') || process.argv.includes('-n');
   // TRIGGER_POST_INDEX: 0=9:00, 1=12:00, 2=15:00, 3=18:00, 4=21:00
@@ -53,15 +61,15 @@ async function main() {
   } else if (triggerPostIndex !== null) {
     console.log(`\n[TRIGGER] TRIGGER_POST_INDEX=${triggerPostIndex} detected`);
     console.log(`[TRIGGER] Will post character at slot ${triggerPostIndex} (${POST_TIMES[triggerPostIndex]?.hour}:00)\n`);
-    
+
     await preparePostsForToday();
-    
+
     if (todaysPosts.length > triggerPostIndex) {
       const post = todaysPosts[triggerPostIndex];
       console.log(`\n[TRIGGER] Posting: ${post.character.name} (${post.character.series})`);
       console.log(`[TRIGGER] Birthday: ${post.character.birthday}`);
       console.log(`[TRIGGER] Image: ${post.imagePath}`);
-      await postSingleBirthday(post);
+      await postSingleBirthday(post, triggerPostIndex);
       console.log('[TRIGGER] Post complete. Exiting...');
       process.exit(0);
     } else {
@@ -134,9 +142,15 @@ async function preparePostsForToday() {
 
     console.log(`\nPrepared ${todaysPosts.length} posts.`);
 
-    // Schedule the posts
+    // Initialize/update state for today
     if (todaysPosts.length > 0) {
-      schedulePosts(todaysPosts, postSingleBirthday);
+      await initializeTodaysState(todaysPosts, POST_TIMES);
+
+      // Schedule the posts with index for duplicate protection
+      schedulePosts(todaysPosts, (post) => {
+        const index = todaysPosts.indexOf(post);
+        return postSingleBirthday(post, index);
+      });
     }
 
   } catch (error) {
@@ -266,10 +280,17 @@ async function preparePostsWithImages(characters) {
 
 /**
  * Post a single birthday tweet
+ * @param {object} postData - Post data with character and imagePath
+ * @param {number} index - Post index for duplicate protection
  */
-async function postSingleBirthday(postData) {
+async function postSingleBirthday(postData, index = null) {
   try {
-    const result = await postBirthdayTweet(postData.character, postData.imagePath);
+    const result = await postBirthdayTweet(postData.character, postData.imagePath, index);
+
+    if (result.skipped) {
+      console.log(`Skipped (already posted): ${postData.character.name}`);
+      return result;
+    }
 
     if (result.success) {
       console.log(`Posted: ${result.url}`);
@@ -308,7 +329,7 @@ async function prepareAndPostAll() {
     const post = todaysPosts[i];
     console.log(`[${i + 1}/${todaysPosts.length}] Posting ${post.character.name}...`);
 
-    await postSingleBirthday(post);
+    await postSingleBirthday(post, i);
 
     // Wait between posts to avoid rate limits
     if (i < todaysPosts.length - 1) {

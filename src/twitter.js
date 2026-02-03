@@ -2,6 +2,7 @@ import { TwitterApi } from 'twitter-api-v2';
 import fs from 'fs/promises';
 import path from 'path';
 import { recordPost, logUsageSummary } from './usage-tracker.js';
+import { isPostAlreadySent, markPostAsSent, markPostAsFailed } from './state.js';
 
 let client = null;
 
@@ -110,9 +111,23 @@ export async function postTweet(text, mediaIds = []) {
  * Post a birthday tweet for a character
  * @param {object} character - Character data
  * @param {string} imagePath - Path to character image
+ * @param {number} postIndex - Index of the post (for duplicate protection)
  */
-export async function postBirthdayTweet(character, imagePath) {
+export async function postBirthdayTweet(character, imagePath, postIndex = null) {
   try {
+    // Check if already posted (duplicate protection)
+    if (postIndex !== null) {
+      const alreadySent = await isPostAlreadySent(postIndex);
+      if (alreadySent) {
+        console.log(`[SKIP] ${character.name} already posted (index ${postIndex})`);
+        return {
+          success: true,
+          skipped: true,
+          reason: 'already_posted'
+        };
+      }
+    }
+
     // Upload the image
     const mediaId = await uploadMedia(imagePath);
 
@@ -122,9 +137,22 @@ export async function postBirthdayTweet(character, imagePath) {
     // Post the tweet
     const result = await postTweet(message, [mediaId]);
 
+    // Update state if successful
+    if (result.success && postIndex !== null) {
+      await markPostAsSent(postIndex, result.id, result.url);
+    } else if (!result.success && postIndex !== null) {
+      await markPostAsFailed(postIndex, result.error);
+    }
+
     return result;
   } catch (error) {
     console.error(`Error posting birthday tweet for ${character.name}:`, error.message);
+
+    // Mark as failed in state
+    if (postIndex !== null) {
+      await markPostAsFailed(postIndex, error.message);
+    }
+
     return {
       success: false,
       error: error.message
