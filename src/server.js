@@ -321,7 +321,7 @@ async function generateDashboard() {
     <footer>
       <p>Auto-refresh cada 30 segundos</p>
       <p style="margin-top: 5px;">Bot activo | ${jobs.length} jobs programados | v${appVersion}</p>
-      <p style="margin-top: 8px;"><a href="/planificado" style="color: #60a5fa;">Planificado</a> · <a href="/vista-previa" style="color: #60a5fa;">Vista previa</a></p>
+      <p style="margin-top: 8px;"><a href="/planificado" style="color: #60a5fa;">Planificado</a> · <a href="/vista-previa" style="color: #60a5fa;">Vista previa (cómo queda cada post antes de publicar)</a></p>
     </footer>
   </div>
 </body>
@@ -375,7 +375,7 @@ async function generatePlanificadoPage(dates, selectedDate, state) {
     <header>
       <h1>📅 Planificado</h1>
       <p style="color:#8b8b8b">Lo programado (guardado 7 días en /data)</p>
-      <p style="margin-top:8px"><a href="/">← Dashboard</a></p>
+      <p style="margin-top:8px"><a href="/">← Dashboard</a> · <a href="/vista-previa?date=${selectedDate}">Ver cómo quedaría cada post (foto + texto)</a></p>
     </header>
     <div class="nav">
       <label>Fecha: </label>
@@ -410,6 +410,7 @@ async function generateVistaPreviaPage(dates, selectedDate, state) {
     .tweet-mock .text { white-space: pre-wrap; word-break: break-word; margin-bottom: 12px; line-height: 1.4; }
     .tweet-mock img { max-width: 100%; border-radius: 12px; display: block; }
     .tweet-mock .meta { color: #8b8b8b; font-size: 0.85em; margin-top: 8px; }
+    .tweet-mock .no-image { background: rgba(255,255,255,0.05); border: 1px dashed #555; border-radius: 12px; padding: 24px; text-align: center; color: #8b8b8b; font-size: 0.9em; margin-top: 8px; }
     .no-posts { text-align: center; padding: 40px; color: #8b8b8b; }
   `;
   const options = dates.map(d => `<option value="${d}" ${d === selectedDate ? 'selected' : ''}>${formatFullDate(d)} (${d})</option>`).join('');
@@ -419,7 +420,8 @@ async function generateVistaPreviaPage(dates, selectedDate, state) {
     const imgUrl = `/preview-image/${selectedDate}/${i}`;
     return `<div class="tweet-mock">
       <div class="text">${escapeHtml(text).replace(/\n/g, '<br>')}</div>
-      <img src="${imgUrl}" alt="" onerror="this.style.display='none'" width="400" />
+      <img src="${imgUrl}" alt="" width="400" onerror="this.style.display='none'; var n=this.nextElementSibling; if(n) n.style.display='block';" />
+      <div class="no-image" style="display:none;">Imagen no disponible aún (se guarda cuando el bot hace la preparación del día)</div>
       <div class="meta">Post #${i + 1} · ${post.scheduledTime} · ${post.character}</div>
     </div>`;
   }).join('');
@@ -430,8 +432,9 @@ async function generateVistaPreviaPage(dates, selectedDate, state) {
   <div class="container">
     <header>
       <h1>👁 Vista previa</h1>
-      <p style="color:#8b8b8b">Cómo quedaría cada post (guardado 7 días en /data)</p>
-      <p style="margin-top:8px"><a href="/">← Dashboard</a></p>
+      <p style="color:#8b8b8b">Así quedaría cada post <strong>antes de publicar</strong> (texto + foto). Sirve para corroborar que la foto es la correcta.</p>
+      <p style="color:#6b7280; font-size:0.9em; margin-top:6px;">Las imágenes se guardan cuando el bot hace la preparación del día (7 días en /data).</p>
+      <p style="margin-top:10px"><a href="/">← Dashboard</a> · <a href="/planificado?date=${selectedDate}">Ver planificado</a></p>
     </header>
     <div class="nav">
       <label>Fecha: </label>
