@@ -65,6 +65,37 @@ scripts\setup-scheduler.bat
 
 Esto creará una tarea que ejecuta el bot diariamente a las 8:30 AM (Argentina).
 
+## Despliegue en Railway
+
+Para que el bot **no pierda el historial de posteos** al hacer deploy (y no vuelva a scrapear personajes nuevos), es necesario usar un **volumen persistente**:
+
+1. En tu proyecto de Railway, ve al servicio del bot.
+2. Abre **Variables** o **Settings** y en **Volumes** agrega un volumen.
+3. Monta el volumen en la ruta: **`/data`**.
+
+Así los archivos `posts-YYYY-MM-DD.json` se guardan en ese volumen y sobreviven a cada deploy. Si no configurás `/data`, cada deploy arranca con estado vacío y el bot puede marcar todo como no publicado y tomar otra lista de personajes.
+
+### Cómo verificar que el estado persiste
+
+1. **Logs al arrancar**  
+   En Railway → tu servicio → **Deployments** → **View Logs**. Buscá:
+   - `[State] Using data directory: /data (Railway: true)` → está usando el directorio correcto.
+   - `[State check] canRecoverFromState: true | state exists: true | ...` → hay estado de hoy y se va a recuperar (no re-scrape).
+   - `[Recovery] Recovering today's posts from state...` → entró por recuperación.
+   - `[Scrape] No recovery: fetching today's birthdays...` → no había estado, scrapea de nuevo.
+
+2. **Endpoint de diagnóstico**  
+   Abrí en el navegador (o con `curl`):
+   ```
+   https://tu-app.railway.app/api/state-check
+   ```
+   Ahí ves:
+   - `dataDir`, `dataDirExists`, `dataDirWritable`: si `/data` existe y se puede escribir (si no, el volumen no está bien montado).
+   - `stateExists`, `canRecoverFromState`, `reason`: por qué se recupera o no.
+   - `filesInData`: archivos en `/data` (deberían aparecer `posts-YYYY-MM-DD.json` después del primer día).
+
+Si `dataDirExists` es `false` o `dataDirWritable` es `false`, el volumen en Railway no está configurado o no está montado en `/data`.
+
 ## Estructura
 
 ```

@@ -85,6 +85,7 @@ export async function initializeTodaysState(posts, postTimes) {
     preparedAt: new Date().toISOString(),
     posts: posts.map((post, index) => ({
       index,
+      acdbId: post.acdbId ?? null,
       character: post.character.name,
       series: post.character.series,
       scheduledTime: formatTime(postTimes[index]),
@@ -116,6 +117,7 @@ function mergeState(existingState, posts, postTimes) {
 
       return {
         index,
+        acdbId: post.acdbId ?? existingPost?.acdbId ?? null,
         character: post.character.name,
         series: post.character.series,
         scheduledTime: formatTime(postTimes[index]),
@@ -211,6 +213,16 @@ export async function getCurrentState() {
 }
 
 /**
+ * Check if we can recover today's posts from state (same characters, no re-scrape)
+ * Returns true if state exists, has posts, and all have acdbId
+ */
+export async function canRecoverFromState(dateString = getTodayDateString()) {
+  const state = await loadState(dateString);
+  if (!state || !state.posts || state.posts.length === 0) return false;
+  return state.posts.every(p => p.acdbId);
+}
+
+/**
  * Clean up old state files (keep last 7 days)
  */
 export async function cleanupOldStateFiles() {
@@ -241,6 +253,7 @@ export default {
   loadState,
   saveState,
   initializeTodaysState,
+  canRecoverFromState,
   isPostAlreadySent,
   markPostAsSent,
   markPostAsFailed,

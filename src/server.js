@@ -1,6 +1,17 @@
 import http from 'http';
-import { getCurrentState } from './state.js';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { getCurrentState, loadState, canRecoverFromState } from './state.js';
 import { getScheduledJobs } from './scheduler.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Misma lógica que state.js para el directorio de datos
+const DATA_DIR = process.env.RAILWAY_ENVIRONMENT
+  ? '/data'
+  : path.join(__dirname, '..', 'data');
 
 const PORT = process.env.PORT || 3000;
 
@@ -325,6 +336,59 @@ export function startServer() {
       // Health check endpoint
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+    } else if (url.pathname === '/api/state-check') {
+      // Diagnóstico: por qué se recupera o no el estado
+      try {
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+        const state = await loadState(today);
+        const canRecover = await canRecoverFromState(today);
+
+        let dataDirExists = false;
+        let dataDirWritable = false;
+        let filesInData = [];
+        let dataDirError = null;
+
+        try {
+          await fs.access(DATA_DIR);
+          dataDirExists = true;
+          const files = await fs.readdir(DATA_DIR);
+          filesInData = files.filter(f => f.endsWith('.json'));
+          const testFile = path.join(DATA_DIR, '.write-test-' + Date.now());
+          await fs.writeFile(testFile, 'ok', 'utf-8');
+          await fs.unlink(testFile);
+          dataDirWritable = true;
+        } catch (e) {
+          dataDirError = e.code || e.message;
+        }
+
+        const payload = {
+          today,
+          dataDir: DATA_DIR,
+          railway: !!process.env.RAILWAY_ENVIRONMENT,
+          dataDirExists,
+          dataDirWritable,
+          dataDirError,
+          filesInData,
+          stateExists: !!state,
+          statePostsCount: state?.posts?.length ?? 0,
+          canRecoverFromState: canRecover,
+          reason: canRecover
+            ? 'Hay estado de hoy con acdbId → al arrancar se recuperan los mismos personajes (no re-scrape).'
+            : !state
+              ? 'No hay archivo de estado para hoy → al arrancar se scrapea de nuevo.'
+              : !state.posts?.every(p => p.acdbId)
+                ? 'El estado no tiene acdbId en todos los posts (estado viejo o primera vez) → se scrapea.'
+                : 'Estado sin posts o vacío.',
+          postsWithAcdbId: state?.posts?.filter(p => p.acdbId).length ?? 0,
+          postsPosted: state?.posts?.filter(p => p.status === 'posted').length ?? 0
+        };
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload, null, 2));
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: error.message, stack: error.stack }));
+      }
     } else {
       // Dashboard HTML
       try {
@@ -340,7 +404,7 @@ export function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Dashboard server running at http://localhost:${PORT}`);
-    console.log(`API endpoint: http://localhost:${PORT}/api/status`);
+    console.log(`API: http://localhost:${PORT}/api/status | Diagnóstico estado: http://localhost:${PORT}/api/state-check`);
   });
 
   return server;

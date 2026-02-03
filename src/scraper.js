@@ -214,4 +214,11 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export default { getTodaysBirthdays };
+/**
+ * Get character details by ACDB id (for recovery from state without re-scraping the list)
+ */
+export async function getCharacterDetailsById(charId) {
+  return getCharacterDetails(charId);
+}
+
+export default { getTodaysBirthdays, getCharacterDetailsById };

@@ -3,12 +3,12 @@ import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 
-import { getTodaysBirthdays } from './src/scraper.js';
+import { getTodaysBirthdays, getCharacterDetailsById } from './src/scraper.js';
 import { searchCharacter, getCharacterPictures, downloadImage } from './src/jikan.js';
 import { initTwitterClient, postBirthdayTweet } from './src/twitter.js';
 import { scheduleDailyPrep, schedulePosts, getScheduledJobs, POST_TIMES } from './src/scheduler.js';
 import { logUsageSummary } from './src/usage-tracker.js';
-import { initializeTodaysState, cleanupOldStateFiles } from './src/state.js';
+import { initializeTodaysState, cleanupOldStateFiles, canRecoverFromState, loadState, isPostAlreadySent } from './src/state.js';
 import { startServer } from './src/server.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -132,11 +132,32 @@ function validateConfig() {
 }
 
 /**
- * Prepare posts for today (called by scheduler or on startup)
+ * Prepare posts for today (called by scheduler or on startup).
+ * If state for today already exists (e.g. after deploy), recover same characters from state
+ * instead of re-scraping so we don't lose "already posted" and don't get new characters.
  */
 async function preparePostsForToday() {
   try {
-    console.log('Fetching today\'s birthdays...');
+    // Si ya hay estado de hoy con acdbId, recuperar desde estado (mismo día, mismo deploy/restart)
+    const canRecover = await canRecoverFromState();
+    const stateForCheck = await loadState();
+    console.log('[State check] canRecoverFromState:', canRecover, '| state exists:', !!stateForCheck, '| posts:', stateForCheck?.posts?.length ?? 0, '| all have acdbId:', stateForCheck?.posts?.every(p => p.acdbId) ?? false);
+
+    if (canRecover) {
+      console.log('[Recovery] Recovering today\'s posts from state (no re-scrape, same characters)...');
+      const state = await loadState();
+      todaysPosts = await recoverPostsFromState(state);
+      console.log(`Recovered ${todaysPosts.length} posts from state.`);
+      if (todaysPosts.length > 0) {
+        schedulePosts(todaysPosts, (post) => {
+          const index = todaysPosts.indexOf(post);
+          return postSingleBirthday(post, index);
+        });
+      }
+      return;
+    }
+
+    console.log('[Scrape] No recovery: fetching today\'s birthdays from ACDB...');
 
     // Get today's birthday characters
     const characters = await getTodaysBirthdays(NUM_POSTS);
@@ -170,6 +191,58 @@ async function preparePostsForToday() {
   } catch (error) {
     console.error('Error preparing posts:', error.message);
   }
+}
+
+/**
+ * Build todaysPosts from existing state (same characters, no new scrape).
+ * For already-posted slots use a placeholder; for pending, re-fetch details and image by acdbId.
+ */
+async function recoverPostsFromState(state) {
+  const posts = [];
+  for (const p of state.posts) {
+    if (p.status === 'posted') {
+      posts.push({
+        acdbId: p.acdbId,
+        character: { name: p.character, series: p.series },
+        imagePath: null
+      });
+      continue;
+    }
+    if (!p.acdbId) {
+      console.warn(`State post ${p.index} has no acdbId, skipping recovery for that slot.`);
+      posts.push({ character: { name: p.character, series: p.series }, imagePath: null });
+      continue;
+    }
+    try {
+      const details = await getCharacterDetailsById(p.acdbId);
+      if (!details) {
+        console.warn(`Could not fetch details for acdbId ${p.acdbId}, using placeholder.`);
+        posts.push({ acdbId: p.acdbId, character: { name: p.character, series: p.series }, imagePath: null });
+        continue;
+      }
+      const char = {
+        id: p.acdbId,
+        name: details.name,
+        series: details.series,
+        thumbnail: details.image,
+        image: details.image,
+        birthday: details.birthday,
+        favorites: details.favorites
+      };
+      const prepared = await preparePostsWithImages([char]);
+      if (prepared.length > 0) {
+        prepared[0].acdbId = p.acdbId;
+        posts.push(prepared[0]);
+      } else {
+        posts.push({ acdbId: p.acdbId, character: { name: p.character, series: p.series }, imagePath: null });
+      }
+      await sleep(300);
+    } catch (e) {
+      console.warn(`Recovery failed for ${p.character}:`, e.message);
+      posts.push({ acdbId: p.acdbId, character: { name: p.character, series: p.series }, imagePath: null });
+    }
+  }
+  return posts;
 }
 
 /**
@@ -269,6 +342,7 @@ async function preparePostsWithImages(characters) {
       console.log(`  [DEBUG] Final image path: ${imagePath}`);
 
       posts.push({
+        acdbId: char.id || null,
         character: {
           name: malChar?.name || char.name,
           name_kanji: malChar?.name_kanji || null,
@@ -299,6 +373,15 @@ async function preparePostsWithImages(characters) {
  */
 async function postSingleBirthday(postData, index = null) {
   try {
+    if (!postData.imagePath) {
+      // Placeholder (already posted or failed to prepare) – skip upload
+      if (index !== null && await isPostAlreadySent(index)) {
+        console.log(`Skipped (already posted): ${postData.character.name}`);
+        return { success: true, skipped: true, reason: 'already_posted' };
+      }
+      console.error(`No image for post index ${index}, skipping.`);
+      return { success: false, error: 'No image' };
+    }
     const result = await postBirthdayTweet(postData.character, postData.imagePath, index);
 
     if (result.skipped) {
