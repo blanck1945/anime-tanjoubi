@@ -184,15 +184,35 @@ export async function searchCharacter(characterName, animeName = null) {
       }
     }
 
-    // Use first result as final fallback
+    // Use first result as final fallback - BUT mark it as unverified
+    let isVerifiedMatch = !!bestMatch;
     if (!bestMatch) {
-      console.log(`  [DEBUG] Using first result as fallback: "${data.data[0].name}"`);
+      console.log(`  [DEBUG] Using first result as fallback: "${data.data[0].name}" (UNVERIFIED)`);
       bestMatch = data.data[0];
+      isVerifiedMatch = false;
     }
 
     // Fetch full character details to get 'about' field
     const fullChar = await getCharacterById(bestMatch.mal_id, animeGenres);
     if (fullChar) {
+      // If unverified match, check if character's anime list contains the expected anime
+      if (!isVerifiedMatch && animeName && fullChar.anime && fullChar.anime.length > 0) {
+        const animeKeywords = animeName
+          .toLowerCase()
+          .replace(/[^\w\s]/g, '')
+          .split(/\s+/)
+          .filter(word => word.length > 2);
+
+        const animeMatches = fullChar.anime.some(a => {
+          const title = (a.title || '').toLowerCase();
+          return animeKeywords.some(keyword => title.includes(keyword));
+        });
+
+        if (!animeMatches) {
+          console.log(`  [WARN] Character "${fullChar.name}" doesn't match anime "${animeName}" - clearing description to avoid wrong info`);
+          fullChar.about = null; // Don't use wrong character's description
+        }
+      }
       return fullChar;
     }
 
