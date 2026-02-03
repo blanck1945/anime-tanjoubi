@@ -48,10 +48,12 @@ async function searchAnime(animeName) {
       return null;
     }
 
-    // Return the first (best) match
+    // Return the first (best) match with genres
+    const anime = data.data[0];
     return {
-      mal_id: data.data[0].mal_id,
-      title: data.data[0].title
+      mal_id: anime.mal_id,
+      title: anime.title,
+      genres: [...(anime.genres || []), ...(anime.themes || [])]
     };
   } catch (error) {
     console.log(`  [DEBUG] Error searching anime "${animeName}": ${error.message}`);
@@ -88,6 +90,7 @@ async function getAnimeCharacters(animeId) {
 export async function searchCharacter(characterName, animeName = null) {
   try {
     let bestMatch = null;
+    let animeGenres = [];
 
     // Strategy 1: Search within specific anime (most accurate, avoids false positives)
     if (animeName) {
@@ -96,6 +99,7 @@ export async function searchCharacter(characterName, animeName = null) {
 
       if (anime) {
         console.log(`  [DEBUG] Found anime: "${anime.title}" (mal_id: ${anime.mal_id})`);
+        animeGenres = anime.genres || [];
         const characters = await getAnimeCharacters(anime.mal_id);
 
         if (characters.length > 0) {
@@ -123,7 +127,7 @@ export async function searchCharacter(characterName, animeName = null) {
 
           if (bestMatch) {
             // Fetch full character details for better images
-            const fullChar = await getCharacterById(bestMatch.mal_id);
+            const fullChar = await getCharacterById(bestMatch.mal_id, animeGenres);
             if (fullChar) {
               return fullChar;
             }
@@ -186,6 +190,13 @@ export async function searchCharacter(characterName, animeName = null) {
       bestMatch = data.data[0];
     }
 
+    // Fetch full character details to get 'about' field
+    const fullChar = await getCharacterById(bestMatch.mal_id, animeGenres);
+    if (fullChar) {
+      return fullChar;
+    }
+
+    // Fallback if getCharacterById fails
     const image = bestMatch.images?.jpg?.image_url || bestMatch.images?.webp?.image_url || null;
     const imageLarge = bestMatch.images?.jpg?.large_image_url || bestMatch.images?.webp?.large_image_url || null;
 
@@ -196,7 +207,9 @@ export async function searchCharacter(characterName, animeName = null) {
       image: image,
       image_large: imageLarge,
       url: bestMatch.url,
-      favorites: bestMatch.favorites || 0
+      favorites: bestMatch.favorites || 0,
+      genres: animeGenres,
+      about: null
     };
   } catch (error) {
     console.error(`Error searching for "${characterName}":`, error.message);
@@ -206,8 +219,10 @@ export async function searchCharacter(characterName, animeName = null) {
 
 /**
  * Get character details by MAL ID
+ * @param {number} malId - MAL character ID
+ * @param {Array} genres - Optional genres from the anime search
  */
-export async function getCharacterById(malId) {
+export async function getCharacterById(malId, genres = []) {
   try {
     const data = await jikanRequest(`/characters/${malId}/full`);
 
@@ -227,6 +242,7 @@ export async function getCharacterById(malId) {
       image_large: char.images?.jpg?.large_image_url,
       url: char.url,
       favorites: char.favorites || 0,
+      genres: genres,
       anime: char.anime?.map(a => ({
         mal_id: a.anime?.mal_id,
         title: a.anime?.title,

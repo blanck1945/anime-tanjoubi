@@ -6,6 +6,7 @@ const ARGENTINA_TZ = 'America/Argentina/Buenos_Aires';
 // Post times in Argentina time (24h format)
 export const POST_TIMES = [
   { hour: 9, minute: 0 },   // 9:00 AM
+  { hour: 10, minute: 30 }, // 10:30 AM
   { hour: 12, minute: 0 },  // 12:00 PM
   { hour: 15, minute: 0 },  // 3:00 PM
   { hour: 18, minute: 0 },  // 6:00 PM

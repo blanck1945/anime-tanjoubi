@@ -13,7 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const TEMP_DIR = path.join(__dirname, 'temp');
-const NUM_POSTS = 5;
+const NUM_POSTS = 6;
 
 // Store prepared posts for the day
 let todaysPosts = [];
@@ -246,7 +246,9 @@ async function preparePostsWithImages(characters) {
           name_kanji: malChar?.name_kanji || null,
           series: char.series,
           favorites: malChar?.favorites || char.favorites,
-          birthday: char.birthday
+          birthday: char.birthday,
+          about: malChar?.about || null,
+          genres: malChar?.genres || []
         },
         imagePath
       });

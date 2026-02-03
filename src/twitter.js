@@ -134,25 +134,93 @@ export async function postBirthdayTweet(character, imagePath) {
 
 /**
  * Create a birthday message for a character
- * @param {object} character - Character data with name, series, and birthday
+ * @param {object} character - Character data with name, series, birthday, about, and genres
  */
 export function createBirthdayMessage(character) {
   const nameHashtag = createHashtag(character.name);
   const seriesHashtag = createHashtag(character.series);
 
-  // Natural style message
-  let message = `🎂 Happy Birthday to ${character.name}! 🎉\n\n`;
-  message += `The beloved character from ${character.series} celebrates their birthday today, ${character.birthday}.\n\n`;
-  message += `#${seriesHashtag} #${nameHashtag} #AnimeBirthday`;
+  // Extraer descripción del personaje
+  const description = extractDescription(character.about);
 
-  // Fallback if too long
+  // Obtener hasta 2 géneros para hashtags
+  const genreHashtags = (character.genres || [])
+    .slice(0, 2)
+    .map(g => `#${createHashtag(g.name || g)}`)
+    .join(' ');
+
+  // Mensaje personalizado
+  let message = `🎂 Happy Birthday to ${character.name}! 🎉\n\n`;
+
+  if (description) {
+    message += `${description}\n\n`;
+  } else {
+    message += `The beloved character from ${character.series} celebrates today.\n\n`;
+  }
+
+  // Fecha
+  message += `📅 ${character.birthday}\n\n`;
+
+  // Hashtags: Serie + Nombre + AnimeBirthday + Anime + HappyBirthday + 2 géneros
+  message += `#${seriesHashtag} #${nameHashtag} #AnimeBirthday #Anime #HappyBirthday ${genreHashtags}`;
+
+  // Fallback si excede 280 caracteres
   if (message.length > 280) {
-    message = `🎂 Happy Birthday to ${character.name}!\n\n`;
-    message += `From ${character.series} 🎉\n\n`;
-    message += `#${seriesHashtag} #AnimeBirthday`;
+    message = `🎂 Happy Birthday ${character.name}! 🎉\n`;
+    message += `From ${character.series}\n\n`;
+    message += `#${seriesHashtag} #AnimeBirthday #Anime #HappyBirthday`;
   }
 
   return message;
+}
+
+/**
+ * Extract a meaningful description from the character's about text
+ * @param {string} about - Raw about text from MAL
+ */
+function extractDescription(about) {
+  if (!about) return null;
+
+  // Patrones de metadata a ignorar
+  const metadataPattern = /^(Age|Birthday|Date of Birth|Height|Weight|Blood|Source|Hair|Eye|Affiliation|Occupation|Status|Race|Gender|Species|Nationality|Position|Allegiance|VA|Voice|Seiyuu|CV|Voiced|Actor|Actress|Japanese|English|Origin|Title|Rank|Role|Class|Abilities|Power|Weapon|Family|Relatives|Partner|Team|Clan|Organization|School|Grade|Year|Zodiac|Sign|Hobbies|Likes|Dislikes|Quote|Motto|Theme|Song|First|Anime|Manga|Novel|Game|Episode|Chapter|Volume|Arc|Saga|Series)[\s]*:/i;
+
+  // Dividir en párrafos y líneas
+  const paragraphs = about.split(/\n\n+/).map(p => p.trim()).filter(p => p);
+
+  for (const paragraph of paragraphs) {
+    // Saltar párrafos cortos o que son solo metadata
+    const lines = paragraph.split('\n').filter(l => l.trim());
+
+    // Buscar línea que sea descripción real (no metadata, más de 50 chars, tiene verbos/estructura de oración)
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      // Saltar metadata
+      if (metadataPattern.test(trimmed)) continue;
+
+      // Saltar líneas cortas
+      if (trimmed.length < 50) continue;
+
+      // Saltar líneas que parecen listas o headers
+      if (trimmed.startsWith('-') || trimmed.startsWith('•') || trimmed.endsWith(':')) continue;
+
+      // Buscar una oración que describa al personaje (usualmente tiene "is", "was", "has", etc.)
+      if (trimmed.match(/\b(is|was|are|were|has|had|becomes|became|works|serves|leads)\b/i)) {
+        // Extraer primera oración completa
+        const sentences = trimmed.match(/[^.!?]+[.!?]+/g);
+        if (sentences && sentences[0]) {
+          const firstSentence = sentences[0].trim();
+          // Limpiar nombre japonés entre paréntesis si está al inicio
+          const cleaned = firstSentence.replace(/\s*\([^)]*[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF][^)]*\)\s*,?\s*/g, ' ').trim();
+          if (cleaned.length > 30) {
+            return cleaned.length > 120 ? cleaned.substring(0, 117) + '...' : cleaned;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
