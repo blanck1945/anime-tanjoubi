@@ -55,26 +55,40 @@ async function main() {
   // TRIGGER_POST_INDEX: 0=9:00, 1=12:00, 2=15:00, 3=18:00, 4=21:00
   const triggerPostIndex = process.env.TRIGGER_POST_INDEX ? parseInt(process.env.TRIGGER_POST_INDEX, 10) : null;
 
+  // En Railway (producción), bloquear posts manuales para evitar duplicados
+  const isProduction = !!process.env.RAILWAY_ENVIRONMENT;
+  const allowManualPosts = process.env.ALLOW_MANUAL_POSTS === 'true';
+
   if (runNow) {
-    console.log('\nRunning immediately (--now flag detected)...\n');
-    await prepareAndPostAll();
-  } else if (triggerPostIndex !== null) {
-    console.log(`\n[TRIGGER] TRIGGER_POST_INDEX=${triggerPostIndex} detected`);
-    console.log(`[TRIGGER] Will post character at slot ${triggerPostIndex} (${POST_TIMES[triggerPostIndex]?.hour}:00)\n`);
-
-    await preparePostsForToday();
-
-    if (todaysPosts.length > triggerPostIndex) {
-      const post = todaysPosts[triggerPostIndex];
-      console.log(`\n[TRIGGER] Posting: ${post.character.name} (${post.character.series})`);
-      console.log(`[TRIGGER] Birthday: ${post.character.birthday}`);
-      console.log(`[TRIGGER] Image: ${post.imagePath}`);
-      await postSingleBirthday(post, triggerPostIndex);
-      console.log('[TRIGGER] Post complete. Exiting...');
-      process.exit(0);
+    if (isProduction && !allowManualPosts) {
+      console.log('\n[BLOCKED] --now flag is disabled in production to prevent duplicates.');
+      console.log('[BLOCKED] Set ALLOW_MANUAL_POSTS=true to override (not recommended).\n');
     } else {
-      console.log(`[TRIGGER] No post available at index ${triggerPostIndex}. Only ${todaysPosts.length} posts prepared.`);
-      process.exit(1);
+      console.log('\nRunning immediately (--now flag detected)...\n');
+      await prepareAndPostAll();
+    }
+  } else if (triggerPostIndex !== null) {
+    if (isProduction && !allowManualPosts) {
+      console.log('\n[BLOCKED] TRIGGER_POST_INDEX is disabled in production to prevent duplicates.');
+      console.log('[BLOCKED] Posts will only be sent via the scheduler.\n');
+    } else {
+      console.log(`\n[TRIGGER] TRIGGER_POST_INDEX=${triggerPostIndex} detected`);
+      console.log(`[TRIGGER] Will post character at slot ${triggerPostIndex} (${POST_TIMES[triggerPostIndex]?.hour}:00)\n`);
+
+      await preparePostsForToday();
+
+      if (todaysPosts.length > triggerPostIndex) {
+        const post = todaysPosts[triggerPostIndex];
+        console.log(`\n[TRIGGER] Posting: ${post.character.name} (${post.character.series})`);
+        console.log(`[TRIGGER] Birthday: ${post.character.birthday}`);
+        console.log(`[TRIGGER] Image: ${post.imagePath}`);
+        await postSingleBirthday(post, triggerPostIndex);
+        console.log('[TRIGGER] Post complete. Exiting...');
+        process.exit(0);
+      } else {
+        console.log(`[TRIGGER] No post available at index ${triggerPostIndex}. Only ${todaysPosts.length} posts prepared.`);
+        process.exit(1);
+      }
     }
   } else {
     // Schedule daily preparation
