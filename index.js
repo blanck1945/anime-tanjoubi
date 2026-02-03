@@ -5,10 +5,14 @@ import { fileURLToPath } from 'url';
 
 import { getTodaysBirthdays, getCharacterDetailsById } from './src/scraper.js';
 import { searchCharacter, getCharacterPictures, downloadImage } from './src/jikan.js';
-import { initTwitterClient, postBirthdayTweet } from './src/twitter.js';
+import { validateImageFile, isUrlLikelyPlaceholder } from './src/image-validation.js';
+import { searchImagesForCharacter, isGoogleImageSearchConfigured } from './src/google-image-search.js';
+import { getCharacterImage as getAnilistImage } from './src/anilist.js';
+import { searchCharacterImages as searchSafebooruImages } from './src/safebooru.js';
+import { initTwitterClient, postBirthdayTweet, createBirthdayMessage } from './src/twitter.js';
 import { scheduleDailyPrep, schedulePosts, getScheduledJobs, POST_TIMES } from './src/scheduler.js';
 import { logUsageSummary } from './src/usage-tracker.js';
-import { initializeTodaysState, cleanupOldStateFiles, canRecoverFromState, loadState, isPostAlreadySent } from './src/state.js';
+import { initializeTodaysState, cleanupOldStateFiles, canRecoverFromState, loadState, isPostAlreadySent, DATA_DIR, getTodayDateString } from './src/state.js';
 import { startServer } from './src/server.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -177,6 +181,26 @@ async function preparePostsForToday() {
 
     console.log(`\nPrepared ${todaysPosts.length} posts.`);
 
+    // Guardar preview (texto + imagen) en /data para la página Vista previa (7 días)
+    if (todaysPosts.length > 0) {
+      const todayDate = getTodayDateString();
+      const previewDir = path.join(DATA_DIR, 'preview', todayDate);
+      await fs.mkdir(previewDir, { recursive: true });
+      for (let i = 0; i < todaysPosts.length; i++) {
+        const post = todaysPosts[i];
+        post.previewText = createBirthdayMessage(post.character);
+        if (post.imagePath) {
+          const ext = path.extname(post.imagePath) || '.jpg';
+          const dest = path.join(previewDir, `${i}${ext}`);
+          try {
+            await fs.copyFile(post.imagePath, dest);
+          } catch (e) {
+            console.warn(`[Preview] No se pudo copiar imagen post ${i}:`, e.message);
+          }
+        }
+      }
+    }
+
     // Initialize/update state for today
     if (todaysPosts.length > 0) {
       await initializeTodaysState(todaysPosts, POST_TIMES);
@@ -268,26 +292,86 @@ async function preparePostsWithImages(characters) {
 
       let imagePath = null;
 
-      // Priority 1: Try ACDB full image (from character page)
-      if (char.image) {
+      // Priority 1: Anilist — imagen oficial del personaje (request directa)
+      const anilistResult = await getAnilistImage(char.name, char.series);
+      if (anilistResult?.url) {
+        const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_anilist.jpg`);
+        imagePath = await downloadImage(anilistResult.url, imageFile);
+        if (imagePath) {
+          const validation = await validateImageFile(imagePath, char.name, char.series);
+          if (validation.valid) {
+            console.log(`  Downloaded image from Anilist`);
+          } else {
+            try { await fs.unlink(imagePath); } catch (_) {}
+            imagePath = null;
+          }
+        }
+      }
+
+      // Priority 2: Safebooru — imágenes por tags (request directa)
+      if (!imagePath) {
+        const safebooruResults = await searchSafebooruImages(char.name, char.series, 5);
+        for (let i = 0; i < safebooruResults.length && !imagePath; i++) {
+          const result = safebooruResults[i];
+          const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_safebooru_${i}.jpg`);
+          const downloaded = await downloadImage(result.url, imageFile);
+          if (downloaded) {
+            const validation = await validateImageFile(downloaded, char.name, char.series);
+            if (validation.valid) {
+              imagePath = downloaded;
+              console.log(`  Downloaded image from Safebooru (result ${i + 1})`);
+            } else {
+              try { await fs.unlink(downloaded); } catch (_) {}
+            }
+          }
+          await sleep(200);
+        }
+      }
+
+      // Priority 3 (si está configurado): Google Image Search — mejor calidad y consistencia
+      if (!imagePath && isGoogleImageSearchConfigured()) {
+        console.log(`  [DEBUG] Searching Google Images for "${char.name}" (${char.series})...`);
+        const googleResults = await searchImagesForCharacter(char.name, char.series, { num: 5, imgSize: 'large' });
+        for (let i = 0; i < googleResults.length && !imagePath; i++) {
+          const result = googleResults[i];
+          const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_google_${i}.jpg`);
+          const downloaded = await downloadImage(result.url, imageFile);
+          if (downloaded) {
+            const validation = await validateImageFile(downloaded, char.name, char.series);
+            if (validation.valid) {
+              imagePath = downloaded;
+              console.log(`  Downloaded image from Google Images (result ${i + 1})`);
+            } else {
+              try { await fs.unlink(downloaded); } catch (_) {}
+            }
+          }
+          await sleep(200);
+        }
+      }
+
+      // Priority 4: Try ACDB full image (from character page)
+      if (!imagePath && char.image && !isUrlLikelyPlaceholder(char.image)) {
         const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_acdb.jpg`);
         console.log(`  [DEBUG] Attempting ACDB image: ${char.image}`);
         
         imagePath = await downloadImage(char.image, imageFile);
 
         if (imagePath) {
-          const stats = await fs.stat(imagePath);
-          if (stats.size > 5000) { // ACDB images should be decent size
-            console.log(`  Downloaded image from ACDB (${stats.size} bytes)`);
-          } else {
-            console.log(`  [DEBUG] ACDB image too small (${stats.size} bytes)`);
-            await fs.unlink(imagePath);
+          const validation = await validateImageFile(imagePath, char.name, char.series);
+          if (!validation.valid) {
+            console.log(`  [VALIDATION] ACDB image rejected: ${validation.reason}`);
+            try { await fs.unlink(imagePath); } catch (_) {}
             imagePath = null;
+          } else {
+            const stats = await fs.stat(imagePath);
+            console.log(`  Downloaded image from ACDB (${stats.size} bytes)`);
           }
         }
+      } else if (!imagePath && char.image && isUrlLikelyPlaceholder(char.image)) {
+        console.log(`  [VALIDATION] ACDB image URL looks like placeholder, skipping`);
       }
 
-      // Priority 2: Try MAL image (prefer large, fallback to regular)
+      // Priority 5: Try MAL image (prefer large, fallback to regular)
       if (!imagePath) {
         const malImageUrl = malChar?.image_large || malChar?.image;
         if (malImageUrl && malImageUrl !== 'undefined') {
@@ -297,13 +381,14 @@ async function preparePostsWithImages(characters) {
           imagePath = await downloadImage(malImageUrl, imageFile);
 
           if (imagePath) {
-            const stats = await fs.stat(imagePath);
-            if (stats.size > 1000) {
-              console.log(`  Downloaded image from MAL (${stats.size} bytes)`);
-            } else {
-              console.log(`  [DEBUG] MAL image too small (${stats.size} bytes)`);
-              await fs.unlink(imagePath);
+            const validation = await validateImageFile(imagePath, char.name, char.series);
+            if (!validation.valid) {
+              console.log(`  [VALIDATION] MAL image rejected: ${validation.reason}`);
+              try { await fs.unlink(imagePath); } catch (_) {}
               imagePath = null;
+            } else {
+              const stats = await fs.stat(imagePath);
+              console.log(`  Downloaded image from MAL (${stats.size} bytes)`);
             }
           } else {
             console.log(`  [DEBUG] MAL image download returned null`);
@@ -311,21 +396,22 @@ async function preparePostsWithImages(characters) {
         }
       }
 
-      // Priority 3: Fallback to ACDB thumbnail (but verify it's not the default placeholder)
-      if (!imagePath && char.thumbnail && !char.thumbnail.includes('forum/67712-596211384')) {
+      // Priority 6: Fallback to ACDB thumbnail (but verify it's not the default placeholder)
+      if (!imagePath && char.thumbnail && !isUrlLikelyPlaceholder(char.thumbnail)) {
         const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_thumb.jpg`);
         console.log(`  [DEBUG] Attempting ACDB thumbnail: ${char.thumbnail}`);
         
         imagePath = await downloadImage(char.thumbnail, imageFile);
 
         if (imagePath) {
-          const stats = await fs.stat(imagePath);
-          if (stats.size > 1000) {
-            console.log(`  Downloaded thumbnail from ACDB (${stats.size} bytes)`);
-          } else {
-            console.log(`  [DEBUG] Thumbnail too small (${stats.size} bytes)`);
-            await fs.unlink(imagePath);
+          const validation = await validateImageFile(imagePath, char.name, char.series);
+          if (!validation.valid) {
+            console.log(`  [VALIDATION] ACDB thumbnail rejected: ${validation.reason}`);
+            try { await fs.unlink(imagePath); } catch (_) {}
             imagePath = null;
+          } else {
+            const stats = await fs.stat(imagePath);
+            console.log(`  Downloaded thumbnail from ACDB (${stats.size} bytes)`);
           }
         } else {
           console.log(`  [DEBUG] Thumbnail download also returned null`);

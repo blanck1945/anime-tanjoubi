@@ -6,7 +6,8 @@ Bot que publica automáticamente cumpleaños de personajes de anime en Twitter/X
 
 - Obtiene los personajes de anime que cumplen años hoy desde [AnimeCharactersDatabase](https://www.animecharactersdatabase.com)
 - Busca imágenes HD en MyAnimeList via [Jikan API](https://jikan.moe)
-- Publica 5 tweets diarios a las 9:00, 12:00, 15:00, 18:00 y 21:00 (hora Argentina)
+- **Imágenes**: varias fuentes por request directa (sin depender de Google): **Anilist** (imagen oficial del personaje), **Safebooru** (imágenes por tags), opcional Google Image Search, MAL y ACDB. Validación de tamaño/dimensiones y opcionalmente Google Vision API.
+- Publica 6 tweets diarios en horarios configurables (hora Argentina)
 - Incluye nombre en kanji y hashtags relevantes
 
 ## Instalación
@@ -26,6 +27,24 @@ API_SECRET=tu_api_secret
 ACCESS_TOKEN=tu_access_token
 ACCESS_TOKEN_SECRET=tu_access_token_secret
 ```
+
+### Validación de imagen (opcional)
+
+Para reducir imágenes equivocadas (personaje incorrecto), se valida:
+- **Siempre**: tamaño mínimo 25 KB y dimensiones ≥ 280×280 px.
+- **Opcional (Google Vision)**: si definís `GOOGLE_VISION_API_KEY` en `.env`, se usa la Vision API para comprobar que en la imagen aparezca el nombre del personaje o la serie. Crear clave en [Google Cloud Console](https://console.cloud.google.com/apis/credentials) y habilitar "Cloud Vision API".
+
+Sin la clave solo se aplican tamaño y dimensiones.
+
+### Google Image Search (recomendado para mejor calidad)
+
+Para usar Google como **fuente prioritaria** de imágenes (evita imágenes equivocadas o de baja calidad):
+
+1. **API key**: [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → Crear clave de API.
+2. **Motor de búsqueda**: [Programmable Search Engine](https://programmablesearchengine.google.com/) → Crear motor que busque "todo el web", activar **búsqueda de imágenes**.
+3. En `.env`: `GOOGLE_API_KEY=...` y `GOOGLE_CSE_ID=...` (el ID del motor, ej. `abc123def456`).
+
+Cuota gratuita: 100 búsquedas/día. Si no está configurado, se usan MAL y ACDB como hasta ahora.
 
 ## Uso
 
@@ -55,6 +74,16 @@ npm start
 ```bash
 node index.js --now
 ```
+
+### Versionado (ligero)
+La versión está en `package.json`. Para subirla antes de un deploy:
+
+```bash
+npm run version:patch   # 1.0.0 → 1.0.1
+npm run version:minor   # 1.0.0 → 1.1.0
+```
+
+Solo actualiza el número en `package.json` y `package-lock.json` (no hace commit ni tag). La versión se ve en el dashboard (pie), en `/api/status`, `/health` y `/api/state-check`.
 
 ## Configurar Task Scheduler (Windows)
 

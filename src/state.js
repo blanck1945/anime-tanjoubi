@@ -6,7 +6,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // En Railway usa el volumen montado en /data, en local usa ./data
-const DATA_DIR = process.env.RAILWAY_ENVIRONMENT
+export const DATA_DIR = process.env.RAILWAY_ENVIRONMENT
   ? '/data'
   : path.join(__dirname, '..', 'data');
 
@@ -18,7 +18,7 @@ const ARGENTINA_TZ = 'America/Argentina/Buenos_Aires';
 /**
  * Get today's date string in YYYY-MM-DD format (Argentina time)
  */
-function getTodayDateString() {
+export function getTodayDateString() {
   return new Date().toLocaleDateString('en-CA', { timeZone: ARGENTINA_TZ });
 }
 
@@ -92,7 +92,8 @@ export async function initializeTodaysState(posts, postTimes) {
       status: 'pending',
       postedAt: null,
       tweetId: null,
-      tweetUrl: null
+      tweetUrl: null,
+      previewText: post.previewText ?? null
     }))
   };
 
@@ -124,7 +125,8 @@ function mergeState(existingState, posts, postTimes) {
         status: existingPost?.status || 'pending',
         postedAt: existingPost?.postedAt || null,
         tweetId: existingPost?.tweetId || null,
-        tweetUrl: existingPost?.tweetUrl || null
+        tweetUrl: existingPost?.tweetUrl || null,
+        previewText: post.previewText ?? existingPost?.previewText ?? null
       };
     })
   };
@@ -223,7 +225,26 @@ export async function canRecoverFromState(dateString = getTodayDateString()) {
 }
 
 /**
- * Clean up old state files (keep last 7 days)
+ * List available state dates (last 7 days)
+ */
+export async function getAvailableDates() {
+  try {
+    const files = await fs.readdir(DATA_DIR);
+    const stateFiles = files.filter(f => f.startsWith('posts-') && f.endsWith('.json'));
+    const dates = stateFiles
+      .map(f => f.match(/posts-(\d{4}-\d{2}-\d{2})\.json/))
+      .filter(Boolean)
+      .map(m => m[1])
+      .sort((a, b) => b.localeCompare(a))
+      .slice(0, 7);
+    return dates;
+  } catch (error) {
+    return [];
+  }
+}
+
+/**
+ * Clean up old state files and preview dirs (keep last 7 days)
  */
 export async function cleanupOldStateFiles() {
   try {
@@ -244,6 +265,28 @@ export async function cleanupOldStateFiles() {
         }
       }
     }
+
+    const previewDir = path.join(DATA_DIR, 'preview');
+    try {
+      const dirs = await fs.readdir(previewDir);
+      for (const d of dirs) {
+        const dirPath = path.join(previewDir, d);
+        const stat = await fs.stat(dirPath);
+        if (stat.isDirectory() && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
+          const dirDate = new Date(d);
+          if (dirDate < cutoffDate) {
+            const entries = await fs.readdir(dirPath, { withFileTypes: true });
+            for (const e of entries) {
+              await fs.unlink(path.join(dirPath, e.name));
+            }
+            await fs.rmdir(dirPath);
+            console.log(`Cleaned up old preview dir: preview/${d}`);
+          }
+        }
+      }
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.error('Error cleaning preview dirs:', e.message);
+    }
   } catch (error) {
     console.error('Error cleaning up old state files:', error.message);
   }
@@ -254,6 +297,7 @@ export default {
   saveState,
   initializeTodaysState,
   canRecoverFromState,
+  getAvailableDates,
   isPostAlreadySent,
   markPostAsSent,
   markPostAsFailed,

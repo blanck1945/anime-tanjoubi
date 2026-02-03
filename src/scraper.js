@@ -1,5 +1,6 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { isUrlLikelyPlaceholder } from './image-validation.js';
 
 const BIRTHDAYS_URL = 'https://www.animecharactersdatabase.com/birthdays.php?today';
 
@@ -164,7 +165,12 @@ async function getCharacterDetails(charId) {
       });
     }
     
-    console.log(`  [DEBUG] ACDB image for ${cleanName(name)}: ${image || 'not found'}`);
+    if (image && isUrlLikelyPlaceholder(image)) {
+      console.log(`  [DEBUG] ACDB image for ${cleanName(name)}: rejected (placeholder/generic URL)`);
+      image = null;
+    } else {
+      console.log(`  [DEBUG] ACDB image for ${cleanName(name)}: ${image || 'not found'}`);
+    }
 
     // Extract favorites/popularity
     let favorites = 0;

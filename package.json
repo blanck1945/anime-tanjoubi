@@ -12,15 +12,23 @@
     "test": "node test.js",
     "post-now": "node scripts/post-now.js",
     "dry-run": "node scripts/dry-run.js",
-    "railway": "node index.js"
+    "railway": "node index.js",
+    "version:patch": "npm version patch --no-git-tag-version",
+    "version:minor": "npm version minor --no-git-tag-version"
   },
-  "keywords": ["anime", "twitter", "bot", "birthday"],
+  "keywords": [
+    "anime",
+    "twitter",
+    "bot",
+    "birthday"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "axios": "^1.13.4",
     "cheerio": "^1.2.0",
     "dotenv": "^17.2.3",
+    "image-size": "^2.0.2",
     "node-schedule": "^2.1.1",
     "twitter-api-v2": "^1.29.0"
   }
