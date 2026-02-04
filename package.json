@@ -12,6 +12,7 @@
     "test": "node test.js",
     "post-now": "node scripts/post-now.js",
     "dry-run": "node scripts/dry-run.js",
+    "build-preview": "node scripts/build-preview.js",
     "railway": "node index.js",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version"
@@ -25,6 +26,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/generative-ai": "^0.21.0",
     "axios": "^1.13.4",
     "cheerio": "^1.2.0",
     "dotenv": "^17.2.3",

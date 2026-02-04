@@ -13,6 +13,9 @@ temp/
 # State files (daily post tracking)
 data/posts-*.json
 
+# Generated preview images
+data/preview/
+
 # Logs
 logs/
 *.log

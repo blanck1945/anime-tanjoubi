@@ -2,15 +2,48 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { isUrlLikelyPlaceholder } from './image-validation.js';
 
-const BIRTHDAYS_URL = 'https://www.animecharactersdatabase.com/birthdays.php?today';
+const BIRTHDAYS_BASE = 'https://www.animecharactersdatabase.com/birthdays.php';
+
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+];
 
 /**
- * Scrape today's birthday characters from animecharactersdatabase.com
- * Returns characters sorted by popularity (favorites count)
+ * URL de cumpleaños para una fecha concreta (evita que el servidor use su timezone y devuelva el día anterior).
+ * @param {Date} [date] - Fecha a usar; por defecto hoy (local).
  */
-export async function getTodaysBirthdays(limit = 5) {
+function getBirthdaysUrl(date = new Date()) {
+  const day = date.getDate();
+  const month = MONTH_NAMES[date.getMonth()];
+  return `${BIRTHDAYS_BASE}?theday=${day}&themonth=${encodeURIComponent(month)}`;
+}
+
+/**
+ * CÓMO VIENE LA DATA DE ACDB (Anime Characters Database)
+ *
+ * Hay dos niveles de scraping:
+ *
+ * 1) Página de cumpleaños del día (birthdays.php?today)
+ *    - Solo lista de personajes: id, name (alt/thumbnail), thumbnail, url.
+ *    - NO hay favoritos en esta página; el orden es el del HTML, no por popularidad.
+ *
+ * 2) Ficha del personaje (characters.php?id=X) — getCharacterDetails(charId)
+ *    - Por cada personaje se hace una petición y se extrae: name, series, image, favorites, birthday.
+ *    - Los favoritos se obtienen con un regex sobre el texto del body (ver comentario en getCharacterDetails).
+ *
+ * Flujo: lista del día (con favoritos "X favorites" por tarjeta) → ordenar por favorites desc → getCharacterDetails solo para top 6.
+ */
+
+/**
+ * Scrape today's birthday characters from animecharactersdatabase.com.
+ * Returns the top N characters by favorites (más populares primero).
+ * Los favoritos se extraen de la página del día (❤️X favorites) para ordenar correctamente.
+ */
+export async function getTodaysBirthdays(limit = 6, date = new Date()) {
   try {
-    const response = await axios.get(BIRTHDAYS_URL, {
+    const url = getBirthdaysUrl(date);
+    const response = await axios.get(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
@@ -19,66 +52,73 @@ export async function getTodaysBirthdays(limit = 5) {
     const $ = cheerio.load(response.data);
     const characters = [];
 
+    // En la página del día ACDB muestra "❤️55 favorites" en cada tarjeta (mismo orden que los links).
+    const bodyText = $('body').text();
+    const favNumbers = [...bodyText.matchAll(/(\d+)\s*favorites?\b/gi)].map(m => parseInt(m[1], 10));
+    let favIndex = 0;
+
     // Parse character cards from the page
-    // The structure has character tiles with images and info
     $('a[href*="characters.php"]').each((i, elem) => {
       const $elem = $(elem);
       const href = $elem.attr('href');
 
-      // Skip navigation links
       if (!href || !href.includes('id=')) return;
 
       const $img = $elem.find('img');
       const imgSrc = $img.attr('src') || $img.attr('data-src');
       const alt = $img.attr('alt') || '';
 
-      // Try to extract character name and series from alt or nearby text
       const $parent = $elem.parent();
       const text = $parent.text().trim();
 
-      // Extract character ID from URL
       const idMatch = href.match(/id=(\d+)/);
       const charId = idMatch ? idMatch[1] : null;
 
       if (charId && imgSrc) {
+        // Asignar favoritos por orden de tarjeta: el n-ésimo personaje recibe el n-ésimo "X favorites".
+        const favorites = favIndex < favNumbers.length ? favNumbers[favIndex++] : 0;
         characters.push({
           id: charId,
           name: alt || text.split('\n')[0]?.trim() || 'Unknown',
           thumbnail: imgSrc.startsWith('http') ? imgSrc : `https://www.animecharactersdatabase.com${imgSrc}`,
-          url: `https://www.animecharactersdatabase.com${href}`
+          url: `https://www.animecharactersdatabase.com${href}`,
+          favorites
         });
       }
     });
 
-    // Remove duplicates by ID
+    // Quitar duplicados por ID (se mantiene la primera aparición, que tiene el orden correcto).
     const uniqueChars = [...new Map(characters.map(c => [c.id, c])).values()];
 
-    // Get detailed info for more characters to sort by favorites
-    const charsToProcess = 25; // Process more to find the most popular ones
+    // Ordenar por favoritos (más populares primero) usando los datos de la página del día.
+    uniqueChars.sort((a, b) => (b.favorites ?? 0) - (a.favorites ?? 0));
+
+    // Solo pedir detalles (nombre, serie, imagen) para los top N que vamos a publicar.
+    const topChars = uniqueChars.slice(0, limit);
     const detailedChars = [];
-    for (const char of uniqueChars.slice(0, charsToProcess)) {
+    for (const char of topChars) {
       try {
         const details = await getCharacterDetails(char.id);
         if (details) {
           detailedChars.push({
             ...char,
-            ...details
+            ...details,
+            favorites: char.favorites ?? details.favorites ?? 0
           });
+        } else {
+          detailedChars.push({ ...char, series: 'Unknown Anime', birthday: formatTodaysBirthday(), image: null });
         }
-        // Rate limit
         await sleep(300);
       } catch (e) {
         console.error(`Failed to get details for ${char.name}:`, e.message);
+        detailedChars.push({ ...char, series: 'Unknown Anime', birthday: formatTodaysBirthday(), image: null });
       }
     }
 
-    // Sort by favorites (most popular first)
-    detailedChars.sort((a, b) => b.favorites - a.favorites);
+    console.log(`[DEBUG] Top ${limit} por favoritos (página del día):`,
+      detailedChars.map(c => `${c.name} (${c.favorites ?? 0} favs)`).join(', '));
 
-    console.log(`[DEBUG] Top ${limit} characters by favorites:`,
-      detailedChars.slice(0, limit).map(c => `${c.name} (${c.favorites} favs)`).join(', '));
-
-    return detailedChars.slice(0, limit);
+    return detailedChars;
   } catch (error) {
     console.error('Error scraping birthdays:', error.message);
     throw error;
@@ -86,7 +126,9 @@ export async function getTodaysBirthdays(limit = 5) {
 }
 
 /**
- * Get detailed character info from their page
+ * Ficha del personaje en ACDB (nivel 2).
+ * URL: characters.php?id={charId}
+ * Extrae: name (h1/title), series (source.php/breadcrumb), image (uploads/thumbs), favorites (regex en body), birthday (hoy).
  */
 async function getCharacterDetails(charId) {
   try {
@@ -172,12 +214,20 @@ async function getCharacterDetails(charId) {
       console.log(`  [DEBUG] ACDB image for ${cleanName(name)}: ${image || 'not found'}`);
     }
 
-    // Extract favorites/popularity
+    // Favoritos: en la ficha ACDB aparece "Fav 41" o "41 favorites". Tomamos el MÁXIMO.
     let favorites = 0;
     const pageText = $('body').text();
-    const favMatch = pageText.match(/(\d+)\s*(?:favorites?|likes?|tribute)/i);
-    if (favMatch) {
-      favorites = parseInt(favMatch[1], 10);
+    const patterns = [
+      /Fav\s*(\d+)/i,
+      /(\d+)\s*(?:favorites?|likes?|tributes?)/gi,
+      /(?:favorites?|likes?|tributes?)\s*:?\s*(\d+)/gi
+    ];
+    for (const re of patterns) {
+      let match;
+      while ((match = re.exec(pageText)) !== null) {
+        const n = parseInt(match[1], 10);
+        if (n > favorites) favorites = n;
+      }
     }
 
     // Get today's date formatted as "Month Day"
@@ -227,4 +277,84 @@ export async function getCharacterDetailsById(charId) {
   return getCharacterDetails(charId);
 }
 
-export default { getTodaysBirthdays, getCharacterDetailsById };
+/**
+ * Solo lista del día (sin abrir fichas). Un solo request.
+ * @returns {Promise<Array<{ id: string, name: string, thumbnail: string, url: string, favorites: number }>>}
+ */
+export async function getTodaysBirthdaysListOnly(date = new Date()) {
+  try {
+    const url = getBirthdaysUrl(date);
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+
+    const $ = cheerio.load(response.data);
+    const byId = new Map();
+    const bodyText = $('body').text();
+    const favNumbers = [...bodyText.matchAll(/(\d+)\s*favorites?\b/gi)].map(m => parseInt(m[1], 10));
+    let favIndex = 0;
+
+    $('a[href*="characters.php"]').each((i, elem) => {
+      const $elem = $(elem);
+      let href = $elem.attr('href') || '';
+      const idMatch = href.match(/id=(\d+)/);
+      const charId = idMatch ? idMatch[1] : null;
+      if (!charId) return;
+
+      const canonicalUrl = `https://www.animecharactersdatabase.com/characters.php?id=${charId}`;
+
+      if (href.includes('facebook.com') || href.includes('sharer')) {
+        let name = 'Unknown';
+        const quoteMatch = href.match(/quote=([^&]+)/);
+        if (quoteMatch) {
+          try {
+            const quote = decodeURIComponent(quoteMatch[1].replace(/\+/g, ' '));
+            const m = quote.match(/Happy Birthday\s+(.+?)\s+from\s+/i);
+            if (m) name = m[1].trim();
+          } catch (_) {}
+        }
+        const existing = byId.get(charId);
+        if (existing) {
+          if (existing.name === 'Unknown' || existing.name === 'Share on Facebook') existing.name = name;
+        } else {
+          const favorites = favIndex < favNumbers.length ? favNumbers[favIndex++] : 0;
+          byId.set(charId, { id: charId, name, thumbnail: null, url: canonicalUrl, favorites });
+        }
+        return;
+      }
+
+      if (!href.includes('id=')) return;
+      const $img = $elem.find('img');
+      const imgSrc = $img.attr('src') || $img.attr('data-src');
+      const alt = $img.attr('alt') || '';
+      const $parent = $elem.parent();
+      const text = $parent.text().trim();
+      const charUrl = href.startsWith('http') ? href : `https://www.animecharactersdatabase.com/${href.replace(/^\//, '')}`;
+      let name = alt || text.split('\n')[0]?.trim() || 'Unknown';
+      if (name.startsWith('Thumbnail of ')) name = name.slice(12).trim();
+
+      if (!imgSrc) return;
+      const thumb = imgSrc.startsWith('http') ? imgSrc : `https://www.animecharactersdatabase.com${imgSrc}`;
+      const existing = byId.get(charId);
+      if (existing) {
+        existing.thumbnail = thumb;
+        existing.url = charUrl;
+        if (existing.name === 'Unknown' || existing.name === 'Share on Facebook') existing.name = name;
+      } else {
+        const favorites = favIndex < favNumbers.length ? favNumbers[favIndex++] : 0;
+        byId.set(charId, { id: charId, name, thumbnail: thumb, url: charUrl, favorites });
+      }
+    });
+
+    const uniqueChars = [...byId.values()];
+    uniqueChars.sort((a, b) => (b.favorites ?? 0) - (a.favorites ?? 0));
+    return uniqueChars;
+  } catch (error) {
+    console.error('Error scraping birthdays list:', error.message);
+    throw error;
+  }
+}
+
+export default { getTodaysBirthdays, getCharacterDetailsById, getTodaysBirthdaysListOnly };

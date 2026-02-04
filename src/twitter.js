@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { recordPost, logUsageSummary } from './usage-tracker.js';
 import { isPostAlreadySent, markPostAsSent, markPostAsFailed } from './state.js';
+import { generateBirthdayMessage as generateBirthdayMessageWithGemini, ensureHashtagsOnNewLine } from './gemini.js';
 
 let client = null;
 
@@ -112,8 +113,9 @@ export async function postTweet(text, mediaIds = []) {
  * @param {object} character - Character data
  * @param {string} imagePath - Path to character image
  * @param {number} postIndex - Index of the post (for duplicate protection)
+ * @param {string} [customMessage] - Optional: use this text instead of generating (e.g. preview text for test post)
  */
-export async function postBirthdayTweet(character, imagePath, postIndex = null) {
+export async function postBirthdayTweet(character, imagePath, postIndex = null, customMessage = null) {
   try {
     // Check if already posted (duplicate protection)
     if (postIndex !== null) {
@@ -131,8 +133,9 @@ export async function postBirthdayTweet(character, imagePath, postIndex = null) 
     // Upload the image
     const mediaId = await uploadMedia(imagePath);
 
-    // Create birthday message
-    const message = createBirthdayMessage(character);
+    // Use custom message (e.g. from preview) or generate with Gemini/fallback
+    let message = customMessage != null ? customMessage : await getBirthdayMessage(character);
+    message = ensureHashtagsOnNewLine(message);
 
     // Post the tweet
     const result = await postTweet(message, [mediaId]);
@@ -161,7 +164,18 @@ export async function postBirthdayTweet(character, imagePath, postIndex = null) 
 }
 
 /**
- * Create a birthday message for a character
+ * Get birthday message: try Gemini first, fallback to rule-based.
+ * @param {object} character - Character data with name, series, birthday, about, and genres
+ * @returns {Promise<string>}
+ */
+export async function getBirthdayMessage(character) {
+  const geminiMessage = await generateBirthdayMessageWithGemini(character);
+  if (geminiMessage) return geminiMessage;
+  return createBirthdayMessage(character);
+}
+
+/**
+ * Create a birthday message for a character (rule-based, used when Gemini is not configured or fails)
  * @param {object} character - Character data with name, series, birthday, about, and genres
  */
 export function createBirthdayMessage(character) {
@@ -286,5 +300,6 @@ export default {
   uploadMedia,
   postTweet,
   postBirthdayTweet,
+  getBirthdayMessage,
   createBirthdayMessage
 };

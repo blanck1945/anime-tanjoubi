@@ -9,16 +9,17 @@ import { validateImageFile, isUrlLikelyPlaceholder } from './src/image-validatio
 import { searchImagesForCharacter, isGoogleImageSearchConfigured } from './src/google-image-search.js';
 import { getCharacterImage as getAnilistImage } from './src/anilist.js';
 import { searchCharacterImages as searchSafebooruImages } from './src/safebooru.js';
-import { initTwitterClient, postBirthdayTweet, createBirthdayMessage } from './src/twitter.js';
+import { initTwitterClient, postBirthdayTweet, getBirthdayMessage } from './src/twitter.js';
 import { scheduleDailyPrep, schedulePosts, getScheduledJobs, POST_TIMES } from './src/scheduler.js';
 import { logUsageSummary } from './src/usage-tracker.js';
-import { initializeTodaysState, cleanupOldStateFiles, canRecoverFromState, loadState, isPostAlreadySent, DATA_DIR, getTodayDateString } from './src/state.js';
+import { initializeTodaysState, cleanupOldStateFiles, canRecoverFromState, loadState, saveState, isPostAlreadySent, DATA_DIR, getTodayDateString } from './src/state.js';
 import { startServer } from './src/server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const TEMP_DIR = path.join(__dirname, 'temp');
+/** Siempre se publican los 6 personajes del día con más favoritos (ACDB). */
 const NUM_POSTS = 6;
 
 // Store prepared posts for the day
@@ -153,6 +154,32 @@ async function preparePostsForToday() {
       todaysPosts = await recoverPostsFromState(state);
       console.log(`Recovered ${todaysPosts.length} posts from state.`);
       if (todaysPosts.length > 0) {
+        // Guardar preview también al recuperar (para que Vista previa muestre imagen + texto)
+        const todayDate = getTodayDateString();
+        const previewDir = path.join(DATA_DIR, 'preview', todayDate);
+        await fs.mkdir(previewDir, { recursive: true });
+        for (let i = 0; i < todaysPosts.length; i++) {
+          const post = todaysPosts[i];
+          post.previewText = await getBirthdayMessage(post.character);
+          if (post.imagePath) {
+            const ext = path.extname(post.imagePath) || '.jpg';
+            const dest = path.join(previewDir, `${i}${ext}`);
+            try {
+              await fs.copyFile(post.imagePath, dest);
+              console.log(`[Preview] Guardada imagen post ${i} en ${dest}`);
+            } catch (e) {
+              console.warn(`[Preview] No se pudo copiar imagen post ${i}:`, e.message);
+            }
+          }
+        }
+        // Actualizar state con previewText para la página Vista previa
+        const stateToUpdate = await loadState();
+        if (stateToUpdate?.posts) {
+          for (let i = 0; i < todaysPosts.length && i < stateToUpdate.posts.length; i++) {
+            stateToUpdate.posts[i].previewText = todaysPosts[i].previewText;
+          }
+          await saveState(stateToUpdate);
+        }
         schedulePosts(todaysPosts, (post) => {
           const index = todaysPosts.indexOf(post);
           return postSingleBirthday(post, index);
@@ -188,12 +215,13 @@ async function preparePostsForToday() {
       await fs.mkdir(previewDir, { recursive: true });
       for (let i = 0; i < todaysPosts.length; i++) {
         const post = todaysPosts[i];
-        post.previewText = createBirthdayMessage(post.character);
+        post.previewText = await getBirthdayMessage(post.character);
         if (post.imagePath) {
           const ext = path.extname(post.imagePath) || '.jpg';
           const dest = path.join(previewDir, `${i}${ext}`);
           try {
             await fs.copyFile(post.imagePath, dest);
+            console.log(`[Preview] Guardada imagen post ${i} en ${dest}`);
           } catch (e) {
             console.warn(`[Preview] No se pudo copiar imagen post ${i}:`, e.message);
           }
@@ -270,9 +298,9 @@ async function recoverPostsFromState(state) {
 }
 
 /**
- * Prepare posts with images from Jikan
+ * Prepare posts with images from Jikan / Anilist / Safebooru / ACDB / MAL
  */
-async function preparePostsWithImages(characters) {
+export async function preparePostsWithImages(characters) {
   const posts = [];
 
   for (const char of characters) {
@@ -427,12 +455,15 @@ async function preparePostsWithImages(characters) {
       
       console.log(`  [DEBUG] Final image path: ${imagePath}`);
 
+      // Preferir serie de MAL para hashtags (evita mezclar con otro anime cuando ACDB tiene serie equivocada)
+      const seriesForTweet = (malChar?.anime?.[0]?.title) || char.series;
+
       posts.push({
         acdbId: char.id || null,
         character: {
           name: malChar?.name || char.name,
           name_kanji: malChar?.name_kanji || null,
-          series: char.series,
+          series: seriesForTweet,
           favorites: malChar?.favorites || char.favorites,
           birthday: char.birthday,
           about: malChar?.about || null,
@@ -525,9 +556,9 @@ async function prepareAndPostAll() {
 }
 
 /**
- * Sanitize filename
+ * Sanitize filename (exported for scripts)
  */
-function sanitizeFilename(name) {
+export function sanitizeFilename(name) {
   return name
     .replace(/[<>:"/\\|?*]/g, '')
     .replace(/\s+/g, '_')
@@ -551,8 +582,11 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-// Start the bot
-main().catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+// Run main only when this file is executed directly (not when imported)
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (isMain) {
+  main().catch(error => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
+}

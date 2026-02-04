@@ -586,19 +586,22 @@ export function startServer() {
         return;
       }
       const previewDir = path.join(DATA_DIR, 'preview', date);
-      const possibleNames = index.includes('.') ? [index] : [`${index}.jpg`, `${index}.png`, `${index}.jpeg`, index];
       let found = false;
-      for (const name of possibleNames) {
-        const filePath = path.join(previewDir, name);
-        try {
+      try {
+        const files = await fs.readdir(previewDir);
+        const prefix = index.includes('.') ? index : index + '.';
+        const match = files.find(f => f === index || f.startsWith(prefix));
+        if (match) {
+          const filePath = path.join(previewDir, match);
           const data = await fs.readFile(filePath);
-          res.writeHead(200, { 'Content-Type': name.endsWith('.png') ? 'image/png' : 'image/jpeg' });
+          const ext = path.extname(match).toLowerCase();
+          const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+          res.writeHead(200, { 'Content-Type': mime });
           res.end(data);
           found = true;
-          break;
-        } catch (e) {
-          if (e.code !== 'ENOENT') throw e;
         }
+      } catch (e) {
+        if (e.code !== 'ENOENT') console.warn('[preview-image]', e.message);
       }
       if (!found) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });

@@ -5,6 +5,26 @@ const RATE_LIMIT_MS = 350; // Jikan allows ~3 requests/second
 
 let lastRequestTime = 0;
 
+/** Normalizar nombre para comparar (acentos, macrones, duplicados). MAL usa "Last, First". */
+function normalizeName(s) {
+  if (!s || typeof s !== 'string') return '';
+  let t = s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/,/g, ' ')
+    .trim();
+  return t.replace(/(.)\1+/g, '$1');
+}
+
+function malNameToFirstLast(name) {
+  if (!name || !name.includes(',')) return name;
+  const [last, ...firstParts] = name.split(',').map(s => s.trim());
+  const first = firstParts.join(' ').trim();
+  return first ? `${first} ${last}` : last;
+}
+
 /**
  * Rate-limited request to Jikan API with retry on 429
  */
@@ -39,7 +59,7 @@ async function jikanRequest(endpoint, retries = 3) {
 /**
  * Search for an anime by name and return its MAL ID
  */
-async function searchAnime(animeName) {
+export async function searchAnime(animeName) {
   try {
     const query = animeName.replace(/[^\w\s]/g, ' ').trim();
     const data = await jikanRequest(`/anime?q=${encodeURIComponent(query)}&limit=5`);
@@ -64,7 +84,7 @@ async function searchAnime(animeName) {
 /**
  * Get all characters from an anime by its MAL ID
  */
-async function getAnimeCharacters(animeId) {
+export async function getAnimeCharacters(animeId) {
   try {
     const data = await jikanRequest(`/anime/${animeId}/characters`);
 
@@ -103,23 +123,19 @@ export async function searchCharacter(characterName, animeName = null) {
         const characters = await getAnimeCharacters(anime.mal_id);
 
         if (characters.length > 0) {
-          // Normalize character name for comparison
-          const searchName = characterName.toLowerCase().replace(/[^\w\s]/g, '').trim();
+          const searchNorm = normalizeName(characterName);
 
-          // Find exact or close match
           for (const charData of characters) {
-            const charName = charData.character.name.toLowerCase();
+            const malNameRaw = (charData.character?.name || '').trim();
+            const malFirstLast = malNameToFirstLast(malNameRaw);
+            const charNorm = normalizeName(malFirstLast);
 
-            // Exact match
-            if (charName === searchName) {
-              console.log(`  [DEBUG] Exact match found: "${charData.character.name}"`);
-              bestMatch = charData.character;
-              break;
-            }
+            const exact = charNorm === searchNorm;
+            const searchParts = searchNorm.split(/\s+/).filter(Boolean);
+            const partial = searchParts.length >= 2 && searchParts.every(p => charNorm.includes(p));
 
-            // Partial match (character name contains search or vice versa)
-            if (charName.includes(searchName) || searchName.includes(charName)) {
-              console.log(`  [DEBUG] Partial match found: "${charData.character.name}"`);
+            if (exact || partial) {
+              console.log(`  [DEBUG] Match found: "${charData.character.name}" (from anime list)`);
               bestMatch = charData.character;
               break;
             }
@@ -146,41 +162,48 @@ export async function searchCharacter(characterName, animeName = null) {
       return null;
     }
 
-    // If we have an anime name, try to match it in the character's anime list
-    if (animeName && !bestMatch) {
+    // Strategy 2: pick best name match; prefer character whose anime list contains ACDB series (si coincide)
+    if (!bestMatch) {
+      const searchNorm = normalizeName(characterName);
       const animeKeywords = animeName
-        .toLowerCase()
-        .replace(/[^\w\s]/g, '')
-        .split(/\s+/)
-        .filter(word => word.length > 2 && !['the', 'no', 'ni', 'wa', 'ga', 'de', 'to'].includes(word));
+        ? animeName.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2 && !['the', 'no', 'ni', 'wa', 'ga', 'de', 'to'].includes(w))
+        : [];
 
-      console.log(`  [DEBUG] Matching anime keywords: ${animeKeywords.join(', ')}`);
-
+      let bestScore = -1;
       for (const char of data.data) {
-        if (char.anime && char.anime.length > 0) {
-          for (const anime of char.anime) {
-            const title = (anime.anime?.title || '').toLowerCase();
-            const keywordMatch = animeKeywords.some(keyword => title.includes(keyword));
-            if (keywordMatch) {
-              console.log(`  [DEBUG] Found match: "${char.name}" in "${anime.anime?.title}"`);
-              bestMatch = char;
-              break;
-            }
-          }
+        const malFirstLast = malNameToFirstLast(char.name || '');
+        const charNorm = normalizeName(malFirstLast);
+        const exact = charNorm === searchNorm;
+        const searchParts = searchNorm.split(/\s+/).filter(Boolean);
+        const partial = searchParts.length >= 2 && searchParts.every(p => charNorm.includes(p));
+        const nameMatch = exact ? 2 : partial ? 1 : 0;
+
+        let hasAnime = 0;
+        if (animeKeywords.length && char.anime?.length) {
+          const titles = char.anime.map(a => (a.anime?.title || '').toLowerCase()).join(' ');
+          if (animeKeywords.some(kw => titles.includes(kw))) hasAnime = 1;
         }
-        if (bestMatch) break;
+
+        const score = nameMatch * 10 + hasAnime;
+        if (nameMatch >= 1 && score > bestScore) {
+          bestScore = score;
+          bestMatch = char;
+        }
       }
 
-      // Try combined search if still no match
-      if (!bestMatch) {
-        console.log(`  [DEBUG] Trying combined search...`);
-        const combinedQuery = `${characterName} ${animeName}`.replace(/[^\w\s]/g, ' ').trim();
-        const data2 = await jikanRequest(`/characters?q=${encodeURIComponent(combinedQuery)}&limit=5`);
+      if (bestMatch) {
+        const animeTitle = bestMatch.anime?.[0]?.anime?.title;
+        console.log(`  [DEBUG] Strategy 2 best match: "${bestMatch.name}"${animeTitle ? ` in "${animeTitle}"` : ''}`);
+      }
+    }
 
-        if (data2.data && data2.data.length > 0) {
-          bestMatch = data2.data[0];
-          console.log(`  [DEBUG] Combined search found: "${bestMatch.name}"`);
-        }
+    if (!bestMatch && animeName) {
+      console.log(`  [DEBUG] Trying combined search...`);
+      const combinedQuery = `${characterName} ${animeName}`.replace(/[^\w\s]/g, ' ').trim();
+      const data2 = await jikanRequest(`/characters?q=${encodeURIComponent(combinedQuery)}&limit=5`);
+      if (data2.data?.length > 0) {
+        bestMatch = data2.data[0];
+        console.log(`  [DEBUG] Combined search found: "${bestMatch.name}"`);
       }
     }
 
@@ -195,6 +218,15 @@ export async function searchCharacter(characterName, animeName = null) {
     // Fetch full character details to get 'about' field
     const fullChar = await getCharacterById(bestMatch.mal_id, animeGenres);
     if (fullChar) {
+      // Poner primero el anime que coincida con la serie buscada (para que series = anime[0].title sea correcto)
+      if (animeName && fullChar.anime?.length > 1) {
+        const kw = animeName.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2);
+        const idx = fullChar.anime.findIndex(a => kw.some(k => (a.title || '').toLowerCase().includes(k)));
+        if (idx > 0) {
+          const [match] = fullChar.anime.splice(idx, 1);
+          fullChar.anime.unshift(match);
+        }
+      }
       // If unverified match, check if character's anime list contains the expected anime
       if (!isVerifiedMatch && animeName && fullChar.anime && fullChar.anime.length > 0) {
         const animeKeywords = animeName
@@ -347,6 +379,8 @@ function sleep(ms) {
 
 export default {
   searchCharacter,
+  searchAnime,
+  getAnimeCharacters,
   getCharacterById,
   getCharacterPictures,
   downloadImage
