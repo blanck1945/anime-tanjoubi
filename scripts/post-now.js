@@ -9,23 +9,31 @@ import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 
 import { getTodaysBirthdays } from '../src/scraper.js';
-import { searchCharacter, downloadImage } from '../src/jikan.js';
+import { searchCharacter } from '../src/jikan.js';
 import { initTwitterClient, postBirthdayTweet } from '../src/twitter.js';
-import { validateImageFile } from '../src/image-validation.js';
-import { searchImagesForCharacter, isGoogleImageSearchConfigured } from '../src/google-image-search.js';
-import { getCharacterImage as getAnilistImage } from '../src/anilist.js';
-import { searchCharacterImages as searchSafebooruImages } from '../src/safebooru.js';
+import { resolveImageForCharacter } from '../src/image-resolver.js';
+import { getDayDoc } from '../src/supabase.js';
+import { downloadPostImage } from '../src/s3.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const TEMP_DIR = path.join(__dirname, '..', 'temp');
+const ARGENTINA_TZ = 'America/Argentina/Buenos_Aires';
+
+function getTodayDateString() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: ARGENTINA_TZ });
+}
 
 // Parse command line arguments
 const args = process.argv.slice(2);
 const numPosts = parseInt(args.find(a => a.match(/^\d+$/)) || '1', 10);
 const delaySeconds = parseInt(args.find(a => a.startsWith('--delay='))?.split('=')[1] || '30', 10);
 const charFilter = args.find(a => a.startsWith('--char='))?.split('=')[1]?.trim(); // e.g. --char=Suguru
+const seriesArg = args.find(a => a.startsWith('--series='))?.slice('--series='.length).replace(/^["']|["']$/g, '').trim() || null;
+// --message="..." : texto exacto del tweet (si no se pasa, se genera con Gemini/fallback)
+const messageArg = args.find(a => a.startsWith('--message='));
+const customMessage = messageArg ? messageArg.slice('--message='.length).replace(/^["']|["']$/g, '').trim() : null;
 
 async function postNow() {
   console.log('===========================================');
@@ -34,6 +42,9 @@ async function postNow() {
     console.log(`  Posting character matching: "${charFilter}"`);
   } else {
     console.log(`  Posting ${numPosts} character(s)`);
+  }
+  if (customMessage) {
+    console.log(`  Custom message: "${customMessage.slice(0, 50)}..."`);
   }
   console.log(`  Delay between posts: ${delaySeconds}s`);
   console.log('===========================================\n');
@@ -57,21 +68,29 @@ async function postNow() {
   // Ensure temp directory exists
   await fs.mkdir(TEMP_DIR, { recursive: true });
 
-  console.log('Fetching today\'s birthdays...\n');
-
   try {
-    let characters = await getTodaysBirthdays(charFilter ? 25 : numPosts);
+    let characters;
 
-    if (charFilter) {
-      const needle = charFilter.toLowerCase();
-      const match = characters.find(c => c.name.toLowerCase().includes(needle));
-      if (!match) {
-        console.log(`No character found matching "${charFilter}" in today's list.`);
-        console.log('Available today:', characters.slice(0, 15).map(c => c.name).join(', '), '...');
-        return;
+    // Modo manual: --char + --series (+ opcional --message) sin depender de la lista del día
+    if (charFilter && seriesArg) {
+      console.log(`Using manual character: ${charFilter} (${seriesArg})\n`);
+      characters = [{ name: charFilter, series: seriesArg, birthday: null }];
+    } else {
+      console.log('Fetching today\'s birthdays...\n');
+      characters = await getTodaysBirthdays(charFilter ? 25 : numPosts);
+
+      if (charFilter) {
+        const needle = charFilter.toLowerCase();
+        const match = characters.find(c => c.name.toLowerCase().includes(needle));
+        if (!match) {
+          console.log(`No character found matching "${charFilter}" in today's list.`);
+          console.log('Tip: use --series="Anime Name" to post anyway with that character/series.\n');
+          console.log('Available today:', characters.slice(0, 15).map(c => c.name).join(', '), '...');
+          return;
+        }
+        characters = [match];
+        console.log(`Found: ${match.name} (${match.series})\n`);
       }
-      characters = [match];
-      console.log(`Found: ${match.name} (${match.series})\n`);
     }
 
     if (characters.length === 0) {
@@ -87,98 +106,57 @@ async function postNow() {
       const char = characters[i];
       console.log(`[${i + 1}/${characters.length}] ${char.name} (${char.series})`);
 
-      // Search on MAL (para nombre y datos del tweet)
       const malChar = await searchCharacter(char.name, char.series);
-
       if (!malChar) {
         console.log('  Could not find on MAL, skipping...');
         continue;
       }
 
+      const displayName = malChar.name || char.name;
       let imagePath = null;
 
-      // Prioridad 1: Anilist — imagen oficial (request directa)
-      const anilistResult = await getAnilistImage(char.name, char.series);
-      if (anilistResult?.url) {
-        const imageFile = path.join(TEMP_DIR, `post_${Date.now()}_anilist.jpg`);
-        imagePath = await downloadImage(anilistResult.url, imageFile);
-        if (imagePath) {
-          const validation = await validateImageFile(imagePath, malChar.name || char.name, char.series);
-          if (validation.valid) {
-            console.log('  Using image from Anilist');
-          } else {
-            try { await fs.unlink(imagePath); } catch (_) {}
-            imagePath = null;
+      // 1) Si hay post del día en Supabase para este personaje, usar ESA imagen (misma que en prep)
+      if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+        try {
+          const today = getTodayDateString();
+          const dayDoc = await getDayDoc(today);
+          const needle = displayName.toLowerCase();
+          const match = dayDoc?.posts?.find(
+            (p) => p.character && (p.character.toLowerCase().includes(needle) || needle.includes(p.character.toLowerCase()))
+          );
+          if (match?.imageUrl) {
+            const tempFile = path.join(TEMP_DIR, `post_supabase_${Date.now()}.jpg`);
+            await downloadPostImage(match.imageUrl, tempFile);
+            imagePath = tempFile;
+            console.log('  Using image from Supabase (same as prep)');
           }
+        } catch (e) {
+          // Si falla Supabase, seguimos con resolución determinista
         }
       }
 
-      // Prioridad 2: Safebooru — imágenes por tags (request directa)
+      // 2) Si no había en Supabase: mismo flujo determinista que prep (image-resolver)
       if (!imagePath) {
-        const safebooruResults = await searchSafebooruImages(char.name, char.series, 5);
-        for (let j = 0; j < safebooruResults.length && !imagePath; j++) {
-          const result = safebooruResults[j];
-          const imageFile = path.join(TEMP_DIR, `post_${Date.now()}_safebooru_${j}.jpg`);
-          const downloaded = await downloadImage(result.url, imageFile);
-          if (downloaded) {
-            const validation = await validateImageFile(downloaded, malChar.name || char.name, char.series);
-            if (validation.valid) {
-              imagePath = downloaded;
-              console.log('  Using image from Safebooru');
-            } else {
-              try { await fs.unlink(downloaded); } catch (_) {}
-            }
-          }
-          await new Promise(r => setTimeout(r, 200));
-        }
-      }
-
-      // Prioridad 3 (si está configurado): Google Image Search
-      if (!imagePath && isGoogleImageSearchConfigured()) {
-        console.log('  Searching Google Images...');
-        const googleResults = await searchImagesForCharacter(char.name, char.series, { num: 5, imgSize: 'large' });
-        for (let j = 0; j < googleResults.length && !imagePath; j++) {
-          const result = googleResults[j];
-          const imageFile = path.join(TEMP_DIR, `post_${Date.now()}_google_${j}.jpg`);
-          const downloaded = await downloadImage(result.url, imageFile);
-          if (downloaded) {
-            const validation = await validateImageFile(downloaded, malChar.name || char.name, char.series);
-            if (validation.valid) {
-              imagePath = downloaded;
-              console.log('  Using image from Google Images');
-            } else {
-              try { await fs.unlink(downloaded); } catch (_) {}
-            }
-          }
-          await new Promise(r => setTimeout(r, 200));
-        }
-      }
-
-      // Prioridad 4: MAL
-      if (!imagePath) {
-        const imageFile = path.join(TEMP_DIR, `post_${Date.now()}.jpg`);
-        imagePath = await downloadImage(malChar.image_large || malChar.image, imageFile);
+        const resolved = await resolveImageForCharacter(char, malChar, TEMP_DIR, {
+          hasAcdb: !!(char.image || char.thumbnail),
+          logSource: true
+        });
+        imagePath = resolved.imagePath;
       }
 
       if (!imagePath) {
-        console.log('  Could not download image, skipping...');
-        continue;
-      }
-
-      const validation = await validateImageFile(imagePath, malChar.name || char.name, char.series);
-      if (!validation.valid) {
-        console.log(`  Image validation failed: ${validation.reason}, skipping...`);
-        try { await fs.unlink(imagePath); } catch (_) {}
+        console.log('  Could not get image, skipping...');
         continue;
       }
 
       // Post tweet
       console.log('  Posting to Twitter...');
-      const result = await postBirthdayTweet({
-        name: malChar.name,
-        series: char.series,
-        birthday: char.birthday
-      }, imagePath);
+      const result = await postBirthdayTweet(
+        { name: malChar.name, series: char.series, birthday: char.birthday },
+        imagePath,
+        null,
+        customMessage
+      );
 
       if (result.success) {
         console.log(`  SUCCESS: ${result.url}`);
@@ -214,12 +192,14 @@ Usage: node scripts/post-now.js [count] [--delay=seconds]
 
 Arguments:
   count         Number of characters to post (default: 1)
-  --char=NAME   Post only the character whose name contains NAME (e.g. --char=Suguru)
+  --char=NAME   Post only the character whose name contains NAME (e.g. --char=Nishiki)
+  --series=T    With --char, use this series to find image (post even if not in today's list)
+  --message=T   Tweet text (use this exact text instead of generating)
   --delay=N     Seconds to wait between posts (default: 30)
 
 Examples:
   node scripts/post-now.js                    # Post 1 character (first of day)
-  node scripts/post-now.js --char=Suguru     # Post only character matching "Suguru"
+  node scripts/post-now.js --char=Nishiki --series="Tokyo Ghoul" --message="Happy birthday..."  # Custom text, any day
   node scripts/post-now.js 3                  # Post top 3 characters
   node scripts/post-now.js 5 --delay=60      # Post 5 with 60s delay
 `);

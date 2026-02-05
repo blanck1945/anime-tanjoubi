@@ -3,461 +3,298 @@ import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 
-import { getTodaysBirthdays, getCharacterDetailsById } from './src/scraper.js';
-import { searchCharacter, getCharacterPictures, downloadImage } from './src/jikan.js';
-import { validateImageFile, isUrlLikelyPlaceholder } from './src/image-validation.js';
-import { searchImagesForCharacter, isGoogleImageSearchConfigured } from './src/google-image-search.js';
-import { getCharacterImage as getAnilistImage } from './src/anilist.js';
-import { searchCharacterImages as searchSafebooruImages } from './src/safebooru.js';
+import { getTodaysBirthdays } from './src/scraper.js';
+import { searchCharacter } from './src/jikan.js';
+import { resolveImageForCharacter } from './src/image-resolver.js';
 import { initTwitterClient, postBirthdayTweet, getBirthdayMessage } from './src/twitter.js';
-import { scheduleDailyPrep, schedulePosts, getScheduledJobs, POST_TIMES } from './src/scheduler.js';
-import { logUsageSummary } from './src/usage-tracker.js';
-import { initializeTodaysState, cleanupOldStateFiles, canRecoverFromState, loadState, saveState, isPostAlreadySent, DATA_DIR, getTodayDateString } from './src/state.js';
-import { startServer } from './src/server.js';
+import { POST_TIMES, PREP_TIME } from './src/scheduler.js';
+import { getDayDoc, saveDayDoc, updatePostStatus, closeMongo } from './src/supabase.js';
+import { uploadPostImage, downloadPostImage } from './src/s3.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const TEMP_DIR = path.join(__dirname, 'temp');
-/** Siempre se publican los 6 personajes del día con más favoritos (ACDB). */
-const NUM_POSTS = 6;
+const NUM_POSTS = 7;
+const ARGENTINA_TZ = 'America/Argentina/Buenos_Aires';
 
-// Store prepared posts for the day
-let todaysPosts = [];
+function getTodayDateString() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: ARGENTINA_TZ });
+}
+
+function formatScheduledTime(timeObj) {
+  const h = timeObj.hour.toString().padStart(2, '0');
+  const m = (timeObj.minute || 0).toString().padStart(2, '0');
+  return `${h}:${m}`;
+}
 
 /**
- * Main entry point
+ * Con 1 solo cron (ej. cada 30 min): decide por hora Argentina si hacer prep o post N.
+ * Ventana de 30 min por slot.
+ */
+function getScheduledActionNow() {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: ARGENTINA_TZ, hour: 'numeric', minute: 'numeric', hour12: false });
+  const parts = formatter.formatToParts(now);
+  const hour = parseInt(parts.find(p => p.type === 'hour')?.value ?? '0', 10);
+  const minute = parseInt(parts.find(p => p.type === 'minute')?.value ?? '0', 10);
+  const slot = hour * 60 + minute;
+  const WINDOW = 30;
+
+  const inWindow = (h, m) => {
+    const start = h * 60 + m;
+    return slot >= start && slot < start + WINDOW;
+  };
+  if (inWindow(PREP_TIME.hour, PREP_TIME.minute)) return 'prep';
+  for (let i = 0; i < POST_TIMES.length; i++) {
+    const t = POST_TIMES[i];
+    if (inWindow(t.hour, t.minute)) return i;
+  }
+  return null;
+}
+
+/**
+ * Main: CRON_ACTION (7 crons) | 1 cron por hora Argentina | local (--prep | --post N)
  */
 async function main() {
+  const cronAction = process.env.CRON_ACTION;
+  const hasPrep = process.argv.includes('--prep');
+  const limitArg = process.argv.find(a => a.startsWith('--limit='));
+  const prepLimit = limitArg ? parseInt(limitArg.split('=')[1], 10) : (process.env.PREP_LIMIT ? parseInt(process.env.PREP_LIMIT, 10) : null);
+  const postArg = process.argv.find(a => a.startsWith('--post='));
+  const postIndexArg = postArg ? parseInt(postArg.split('=')[1], 10) : null;
+
+  if (cronAction === 'prep' || hasPrep) {
+    await runPrep(isNaN(prepLimit) ? null : prepLimit);
+    await closeMongo();
+    process.exit(0);
+  }
+
+  if (cronAction === 'post' || (postIndexArg !== undefined && !isNaN(postIndexArg))) {
+    const index = cronAction === 'post'
+      ? parseInt(process.env.CRON_POST_INDEX ?? '0', 10)
+      : postIndexArg;
+    await runPost(index);
+    await closeMongo();
+    process.exit(0);
+  }
+
+  // 1 solo cron en Railway: decidir por hora Argentina (ventanas de 30 min)
+  const scheduled = getScheduledActionNow();
+  if (scheduled === 'prep') {
+    console.log('[Cron] Hora Argentina: ejecutando prep');
+    await runPrep(null);
+    await closeMongo();
+    process.exit(0);
+  }
+  if (typeof scheduled === 'number') {
+    // Si aún no hay prep del día, hacer prep primero (primer run del día)
+    const date = getTodayDateString();
+    const doc = await getDayDoc(date);
+    if (!doc?.posts?.length) {
+      console.log('[Cron] No hay posts del día; ejecutando prep primero');
+      await runPrep(null);
+    }
+    console.log(`[Cron] Hora Argentina: ejecutando post ${scheduled}`);
+    await runPost(scheduled);
+    await closeMongo();
+    process.exit(0);
+  }
+
+  if (process.env.RAILWAY_CRON || process.env.RAILWAY_ENVIRONMENT) {
+    process.exit(0);
+  }
+  console.log('Usage: CRON_ACTION=prep node index.js  |  node index.js --prep  |  node index.js --post=0');
+  process.exit(1);
+}
+
+function validateConfig() {
+  const required = ['API_KEY', 'API_SECRET', 'ACCESS_TOKEN', 'ACCESS_TOKEN_SECRET'];
+  const missing = required.filter(key => !process.env[key]);
+  if (missing.length > 0) {
+    console.error('Missing required environment variables:', missing.join(', '));
+    process.exit(1);
+  }
+}
+
+/**
+ * Prep: scrape ACDB, prepare images, Gemini texts, upload to S3, save to Supabase
+ * @param {number|null} limit - Número de personajes (ej. 1 para test). Si null, usa NUM_POSTS (6).
+ */
+async function runPrep(limit = null) {
   console.log('===========================================');
-  console.log('  Anime Birthday Bot - Starting...');
+  console.log('  Anime Birthday Bot - PREP');
   console.log('===========================================');
 
-  // Validate environment variables
   validateConfig();
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for prep');
+    process.exit(1);
+  }
+  if (!process.env.S3_BUCKET && !process.env.AWS_BUCKET) {
+    console.error('S3_BUCKET (or AWS_BUCKET) is required for prep');
+    process.exit(1);
+  }
 
-  // Initialize Twitter client
+  const prepLimit = limit ?? NUM_POSTS;
+  if (prepLimit === 1) {
+    console.log('[TEST] Prep limitado a 1 personaje\n');
+  }
+
   initTwitterClient({
     apiKey: process.env.API_KEY,
     apiSecret: process.env.API_SECRET,
     accessToken: process.env.ACCESS_TOKEN,
     accessTokenSecret: process.env.ACCESS_TOKEN_SECRET
   });
-
-  console.log('Twitter client initialized.');
-
-  // Ensure temp directory exists
   await fs.mkdir(TEMP_DIR, { recursive: true });
 
-  // Clean up old state files (keep last 7 days)
-  await cleanupOldStateFiles();
+  const date = getTodayDateString();
+  console.log(`Date (Argentina): ${date}\n`);
 
-  // Start the dashboard server
-  startServer();
+  const characters = await getTodaysBirthdays(prepLimit);
+  if (characters.length === 0) {
+    console.log('No birthday characters found for today.');
+    return;
+  }
 
-  // Check if we should run immediately (for testing) or schedule
-  const runNow = process.argv.includes('--now') || process.argv.includes('-n');
-  // TRIGGER_POST_INDEX: 0=9:00, 1=12:00, 2=15:00, 3=18:00, 4=21:00
-  const triggerPostIndex = process.env.TRIGGER_POST_INDEX ? parseInt(process.env.TRIGGER_POST_INDEX, 10) : null;
+  console.log(`Found ${characters.length} characters:`);
+  characters.forEach((c, i) => console.log(`  ${i + 1}. ${c.name} (${c.series})`));
 
-  // En Railway (producción), bloquear posts manuales para evitar duplicados
-  const isProduction = !!process.env.RAILWAY_ENVIRONMENT;
-  const allowManualPosts = process.env.ALLOW_MANUAL_POSTS === 'true';
+  const preparedPosts = await preparePostsWithImages(characters);
+  if (preparedPosts.length === 0) {
+    console.log('No posts prepared (no valid images).');
+    return;
+  }
 
-  if (runNow) {
-    if (isProduction && !allowManualPosts) {
-      console.log('\n[BLOCKED] --now flag is disabled in production to prevent duplicates.');
-      console.log('[BLOCKED] Set ALLOW_MANUAL_POSTS=true to override (not recommended).\n');
-    } else {
-      console.log('\nRunning immediately (--now flag detected)...\n');
-      await prepareAndPostAll();
-    }
-  } else if (triggerPostIndex !== null) {
-    if (isProduction && !allowManualPosts) {
-      console.log('\n[BLOCKED] TRIGGER_POST_INDEX is disabled in production to prevent duplicates.');
-      console.log('[BLOCKED] Posts will only be sent via the scheduler.\n');
-    } else {
-      console.log(`\n[TRIGGER] TRIGGER_POST_INDEX=${triggerPostIndex} detected`);
-      console.log(`[TRIGGER] Will post character at slot ${triggerPostIndex} (${POST_TIMES[triggerPostIndex]?.hour}:00)\n`);
-
-      await preparePostsForToday();
-
-      if (todaysPosts.length > triggerPostIndex) {
-        const post = todaysPosts[triggerPostIndex];
-        console.log(`\n[TRIGGER] Posting: ${post.character.name} (${post.character.series})`);
-        console.log(`[TRIGGER] Birthday: ${post.character.birthday}`);
-        console.log(`[TRIGGER] Image: ${post.imagePath}`);
-        await postSingleBirthday(post, triggerPostIndex);
-        console.log('[TRIGGER] Post complete. Exiting...');
-        process.exit(0);
-      } else {
-        console.log(`[TRIGGER] No post available at index ${triggerPostIndex}. Only ${todaysPosts.length} posts prepared.`);
-        process.exit(1);
+  const posts = [];
+  for (let i = 0; i < preparedPosts.length; i++) {
+    const post = preparedPosts[i];
+    const previewText = await getBirthdayMessage(post.character);
+    let imageUrl = null;
+    if (post.imagePath) {
+      try {
+        imageUrl = await uploadPostImage(post.imagePath, date, post.character.name, i);
+        console.log(`[S3] ${i} ${post.character.name} -> ${imageUrl}`);
+      } catch (e) {
+        console.warn(`[S3] Upload failed for ${post.character.name}:`, e.message);
       }
     }
-  } else {
-    // Schedule daily preparation
-    scheduleDailyPrep(preparePostsForToday);
-
-    // Check if we should prepare now (if it's after prep time but before last post time)
-    // Use Argentina timezone for the check
-    const now = new Date();
-    const argentinaHour = parseInt(now.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires', hour: 'numeric', hour12: false }));
-
-    if (argentinaHour >= 8 && argentinaHour < 22) {
-      console.log('\nPreparing posts for today...\n');
-      await preparePostsForToday();
-    }
-
-    console.log('\n===========================================');
-    console.log('  Bot is running. Scheduled jobs:');
-    console.log('===========================================');
-
-    const jobs = getScheduledJobs();
-    jobs.forEach(job => {
-      console.log(`  - ${job.name}: ${job.nextInvocation?.toLocaleString() || 'pending'}`);
+    posts.push({
+      index: i,
+      character: post.character.name,
+      series: post.character.series,
+      scheduledTime: formatScheduledTime(POST_TIMES[i] || { hour: 9, minute: 0 }),
+      previewText: previewText || '',
+      imageUrl,
+      status: 'pending',
+      postedAt: null,
+      tweetUrl: null,
+      error: null
     });
-
-    console.log('\nPress Ctrl+C to stop.\n');
   }
+
+  const doc = {
+    date,
+    preparedAt: new Date().toISOString(),
+    posts
+  };
+  await saveDayDoc(doc);
+  console.log(`\nSaved to Supabase: ${date} (${posts.length} posts)`);
 }
 
 /**
- * Validate required configuration
+ * Post: load day from Mongo, post at index, update Mongo
  */
-function validateConfig() {
-  const required = ['API_KEY', 'API_SECRET', 'ACCESS_TOKEN', 'ACCESS_TOKEN_SECRET'];
-  const missing = required.filter(key => !process.env[key]);
+async function runPost(index) {
+  console.log('===========================================');
+  console.log('  Anime Birthday Bot - POST', index);
+  console.log('===========================================');
 
-  if (missing.length > 0) {
-    console.error('Missing required environment variables:', missing.join(', '));
-    console.error('Please create a .env file with your Twitter API credentials.');
+  validateConfig();
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for post');
     process.exit(1);
   }
-}
 
-/**
- * Prepare posts for today (called by scheduler or on startup).
- * If state for today already exists (e.g. after deploy), recover same characters from state
- * instead of re-scraping so we don't lose "already posted" and don't get new characters.
- */
-async function preparePostsForToday() {
+  initTwitterClient({
+    apiKey: process.env.API_KEY,
+    apiSecret: process.env.API_SECRET,
+    accessToken: process.env.ACCESS_TOKEN,
+    accessTokenSecret: process.env.ACCESS_TOKEN_SECRET
+  });
+  await fs.mkdir(TEMP_DIR, { recursive: true });
+
+  const date = getTodayDateString();
+  const doc = await getDayDoc(date);
+  if (!doc?.posts?.length) {
+    console.log('No day document for', date);
+    return;
+  }
+
+  const post = doc.posts[index];
+  if (!post) {
+    console.log('No post at index', index);
+    return;
+  }
+  if (post.status === 'posted') {
+    console.log('Already posted:', post.character);
+    return;
+  }
+  if (!post.imageUrl) {
+    console.error('No imageUrl for post', index);
+    await updatePostStatus(date, index, { status: 'error', error: 'No imageUrl' });
+    return;
+  }
+
+  const character = { name: post.character, series: post.series };
+  const tempPath = path.join(TEMP_DIR, `post_${date}_${index}_${Date.now()}.jpg`);
+
   try {
-    // Si ya hay estado de hoy con acdbId, recuperar desde estado (mismo día, mismo deploy/restart)
-    const canRecover = await canRecoverFromState();
-    const stateForCheck = await loadState();
-    console.log('[State check] canRecoverFromState:', canRecover, '| state exists:', !!stateForCheck, '| posts:', stateForCheck?.posts?.length ?? 0, '| all have acdbId:', stateForCheck?.posts?.every(p => p.acdbId) ?? false);
+    await downloadPostImage(post.imageUrl, tempPath);
+    const result = await postBirthdayTweet(character, tempPath, index, post.previewText);
 
-    if (canRecover) {
-      console.log('[Recovery] Recovering today\'s posts from state (no re-scrape, same characters)...');
-      const state = await loadState();
-      todaysPosts = await recoverPostsFromState(state);
-      console.log(`Recovered ${todaysPosts.length} posts from state.`);
-      if (todaysPosts.length > 0) {
-        // Guardar preview también al recuperar (para que Vista previa muestre imagen + texto)
-        const todayDate = getTodayDateString();
-        const previewDir = path.join(DATA_DIR, 'preview', todayDate);
-        await fs.mkdir(previewDir, { recursive: true });
-        for (let i = 0; i < todaysPosts.length; i++) {
-          const post = todaysPosts[i];
-          post.previewText = await getBirthdayMessage(post.character);
-          if (post.imagePath) {
-            const ext = path.extname(post.imagePath) || '.jpg';
-            const dest = path.join(previewDir, `${i}${ext}`);
-            try {
-              await fs.copyFile(post.imagePath, dest);
-              console.log(`[Preview] Guardada imagen post ${i} en ${dest}`);
-            } catch (e) {
-              console.warn(`[Preview] No se pudo copiar imagen post ${i}:`, e.message);
-            }
-          }
-        }
-        // Actualizar state con previewText para la página Vista previa
-        const stateToUpdate = await loadState();
-        if (stateToUpdate?.posts) {
-          for (let i = 0; i < todaysPosts.length && i < stateToUpdate.posts.length; i++) {
-            stateToUpdate.posts[i].previewText = todaysPosts[i].previewText;
-          }
-          await saveState(stateToUpdate);
-        }
-        schedulePosts(todaysPosts, (post) => {
-          const index = todaysPosts.indexOf(post);
-          return postSingleBirthday(post, index);
-        });
-      }
-      return;
-    }
-
-    console.log('[Scrape] No recovery: fetching today\'s birthdays from ACDB...');
-
-    // Get today's birthday characters
-    const characters = await getTodaysBirthdays(NUM_POSTS);
-
-    if (characters.length === 0) {
-      console.log('No birthday characters found for today.');
-      return;
-    }
-
-    console.log(`Found ${characters.length} birthday characters:`);
-    characters.forEach((char, i) => {
-      console.log(`  ${i + 1}. ${char.name} (${char.series})`);
-    });
-
-    // Prepare posts with images
-    todaysPosts = await preparePostsWithImages(characters);
-
-    console.log(`\nPrepared ${todaysPosts.length} posts.`);
-
-    // Guardar preview (texto + imagen) en /data para la página Vista previa (7 días)
-    if (todaysPosts.length > 0) {
-      const todayDate = getTodayDateString();
-      const previewDir = path.join(DATA_DIR, 'preview', todayDate);
-      await fs.mkdir(previewDir, { recursive: true });
-      for (let i = 0; i < todaysPosts.length; i++) {
-        const post = todaysPosts[i];
-        post.previewText = await getBirthdayMessage(post.character);
-        if (post.imagePath) {
-          const ext = path.extname(post.imagePath) || '.jpg';
-          const dest = path.join(previewDir, `${i}${ext}`);
-          try {
-            await fs.copyFile(post.imagePath, dest);
-            console.log(`[Preview] Guardada imagen post ${i} en ${dest}`);
-          } catch (e) {
-            console.warn(`[Preview] No se pudo copiar imagen post ${i}:`, e.message);
-          }
-        }
-      }
-    }
-
-    // Initialize/update state for today
-    if (todaysPosts.length > 0) {
-      await initializeTodaysState(todaysPosts, POST_TIMES);
-
-      // Schedule the posts with index for duplicate protection
-      schedulePosts(todaysPosts, (post) => {
-        const index = todaysPosts.indexOf(post);
-        return postSingleBirthday(post, index);
+    if (result.success && !result.skipped) {
+      await updatePostStatus(date, index, {
+        status: 'posted',
+        postedAt: new Date().toISOString(),
+        tweetUrl: result.url
       });
+      console.log('Posted:', result.url);
+    } else if (result.skipped) {
+      console.log('Skipped:', result.reason);
+    } else {
+      await updatePostStatus(date, index, { status: 'error', error: result.error });
+      console.error('Failed:', result.error);
     }
-
-  } catch (error) {
-    console.error('Error preparing posts:', error.message);
+  } finally {
+    try { await fs.unlink(tempPath); } catch (_) {}
   }
 }
 
 /**
- * Build todaysPosts from existing state (same characters, no new scrape).
- * For already-posted slots use a placeholder; for pending, re-fetch details and image by acdbId.
- */
-async function recoverPostsFromState(state) {
-  const posts = [];
-  for (const p of state.posts) {
-    if (p.status === 'posted') {
-      posts.push({
-        acdbId: p.acdbId,
-        character: { name: p.character, series: p.series },
-        imagePath: null
-      });
-      continue;
-    }
-    if (!p.acdbId) {
-      console.warn(`State post ${p.index} has no acdbId, skipping recovery for that slot.`);
-      posts.push({ character: { name: p.character, series: p.series }, imagePath: null });
-      continue;
-    }
-    try {
-      const details = await getCharacterDetailsById(p.acdbId);
-      if (!details) {
-        console.warn(`Could not fetch details for acdbId ${p.acdbId}, using placeholder.`);
-        posts.push({ acdbId: p.acdbId, character: { name: p.character, series: p.series }, imagePath: null });
-        continue;
-      }
-      const char = {
-        id: p.acdbId,
-        name: details.name,
-        series: details.series,
-        thumbnail: details.image,
-        image: details.image,
-        birthday: details.birthday,
-        favorites: details.favorites
-      };
-      const prepared = await preparePostsWithImages([char]);
-      if (prepared.length > 0) {
-        prepared[0].acdbId = p.acdbId;
-        posts.push(prepared[0]);
-      } else {
-        posts.push({ acdbId: p.acdbId, character: { name: p.character, series: p.series }, imagePath: null });
-      }
-      await sleep(300);
-    } catch (e) {
-      console.warn(`Recovery failed for ${p.character}:`, e.message);
-      posts.push({ acdbId: p.acdbId, character: { name: p.character, series: p.series }, imagePath: null });
-    }
-  }
-  return posts;
-}
-
-/**
- * Prepare posts with images from Jikan / Anilist / Safebooru / ACDB / MAL
+ * Prepare posts with images — flujo determinista (mismo orden que post-now)
+ * Ver src/image-resolver.js
  */
 export async function preparePostsWithImages(characters) {
   const posts = [];
 
   for (const char of characters) {
     console.log(`\nPreparing post for ${char.name}...`);
-    console.log(`  [DEBUG] Character data: name="${char.name}", series="${char.series}", birthday="${char.birthday}", thumbnail="${char.thumbnail}"`);
 
     try {
-      // Search for character on MAL via Jikan
-      console.log(`  [DEBUG] Searching MAL for "${char.name}" in "${char.series}"...`);
       const malChar = await searchCharacter(char.name, char.series);
-
-      if (malChar) {
-        console.log(`  [DEBUG] MAL result: name="${malChar.name}", image="${malChar.image}", image_large="${malChar.image_large}"`);
-      } else {
-        console.log(`  [DEBUG] MAL search returned null`);
-      }
-
-      let imagePath = null;
-
-      // Priority 1: Anilist — imagen oficial del personaje (request directa)
-      const anilistResult = await getAnilistImage(char.name, char.series);
-      if (anilistResult?.url) {
-        const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_anilist.jpg`);
-        imagePath = await downloadImage(anilistResult.url, imageFile);
-        if (imagePath) {
-          const validation = await validateImageFile(imagePath, char.name, char.series);
-          if (validation.valid) {
-            console.log(`  Downloaded image from Anilist`);
-          } else {
-            try { await fs.unlink(imagePath); } catch (_) {}
-            imagePath = null;
-          }
-        }
-      }
-
-      // Priority 2: Safebooru — imágenes por tags (request directa)
-      if (!imagePath) {
-        const safebooruResults = await searchSafebooruImages(char.name, char.series, 5);
-        for (let i = 0; i < safebooruResults.length && !imagePath; i++) {
-          const result = safebooruResults[i];
-          const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_safebooru_${i}.jpg`);
-          const downloaded = await downloadImage(result.url, imageFile);
-          if (downloaded) {
-            const validation = await validateImageFile(downloaded, char.name, char.series);
-            if (validation.valid) {
-              imagePath = downloaded;
-              console.log(`  Downloaded image from Safebooru (result ${i + 1})`);
-            } else {
-              try { await fs.unlink(downloaded); } catch (_) {}
-            }
-          }
-          await sleep(200);
-        }
-      }
-
-      // Priority 3 (si está configurado): Google Image Search — mejor calidad y consistencia
-      if (!imagePath && isGoogleImageSearchConfigured()) {
-        console.log(`  [DEBUG] Searching Google Images for "${char.name}" (${char.series})...`);
-        const googleResults = await searchImagesForCharacter(char.name, char.series, { num: 5, imgSize: 'large' });
-        for (let i = 0; i < googleResults.length && !imagePath; i++) {
-          const result = googleResults[i];
-          const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_google_${i}.jpg`);
-          const downloaded = await downloadImage(result.url, imageFile);
-          if (downloaded) {
-            const validation = await validateImageFile(downloaded, char.name, char.series);
-            if (validation.valid) {
-              imagePath = downloaded;
-              console.log(`  Downloaded image from Google Images (result ${i + 1})`);
-            } else {
-              try { await fs.unlink(downloaded); } catch (_) {}
-            }
-          }
-          await sleep(200);
-        }
-      }
-
-      // Priority 4: Try ACDB full image (from character page)
-      if (!imagePath && char.image && !isUrlLikelyPlaceholder(char.image)) {
-        const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_acdb.jpg`);
-        console.log(`  [DEBUG] Attempting ACDB image: ${char.image}`);
-        
-        imagePath = await downloadImage(char.image, imageFile);
-
-        if (imagePath) {
-          const validation = await validateImageFile(imagePath, char.name, char.series);
-          if (!validation.valid) {
-            console.log(`  [VALIDATION] ACDB image rejected: ${validation.reason}`);
-            try { await fs.unlink(imagePath); } catch (_) {}
-            imagePath = null;
-          } else {
-            const stats = await fs.stat(imagePath);
-            console.log(`  Downloaded image from ACDB (${stats.size} bytes)`);
-          }
-        }
-      } else if (!imagePath && char.image && isUrlLikelyPlaceholder(char.image)) {
-        console.log(`  [VALIDATION] ACDB image URL looks like placeholder, skipping`);
-      }
-
-      // Priority 5: Try MAL image (prefer large, fallback to regular)
-      if (!imagePath) {
-        const malImageUrl = malChar?.image_large || malChar?.image;
-        if (malImageUrl && malImageUrl !== 'undefined') {
-          const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_mal.jpg`);
-          console.log(`  [DEBUG] Attempting MAL image: ${malImageUrl}`);
-          
-          imagePath = await downloadImage(malImageUrl, imageFile);
-
-          if (imagePath) {
-            const validation = await validateImageFile(imagePath, char.name, char.series);
-            if (!validation.valid) {
-              console.log(`  [VALIDATION] MAL image rejected: ${validation.reason}`);
-              try { await fs.unlink(imagePath); } catch (_) {}
-              imagePath = null;
-            } else {
-              const stats = await fs.stat(imagePath);
-              console.log(`  Downloaded image from MAL (${stats.size} bytes)`);
-            }
-          } else {
-            console.log(`  [DEBUG] MAL image download returned null`);
-          }
-        }
-      }
-
-      // Priority 6: Fallback to ACDB thumbnail (but verify it's not the default placeholder)
-      if (!imagePath && char.thumbnail && !isUrlLikelyPlaceholder(char.thumbnail)) {
-        const imageFile = path.join(TEMP_DIR, `${sanitizeFilename(char.name)}_thumb.jpg`);
-        console.log(`  [DEBUG] Attempting ACDB thumbnail: ${char.thumbnail}`);
-        
-        imagePath = await downloadImage(char.thumbnail, imageFile);
-
-        if (imagePath) {
-          const validation = await validateImageFile(imagePath, char.name, char.series);
-          if (!validation.valid) {
-            console.log(`  [VALIDATION] ACDB thumbnail rejected: ${validation.reason}`);
-            try { await fs.unlink(imagePath); } catch (_) {}
-            imagePath = null;
-          } else {
-            const stats = await fs.stat(imagePath);
-            console.log(`  Downloaded thumbnail from ACDB (${stats.size} bytes)`);
-          }
-        } else {
-          console.log(`  [DEBUG] Thumbnail download also returned null`);
-        }
-      } else if (!imagePath) {
-        console.log(`  [DEBUG] No valid image source available`);
-      }
+      const { imagePath, source } = await resolveImageForCharacter(char, malChar, TEMP_DIR, {
+        hasAcdb: true,
+        logSource: true
+      });
 
       if (!imagePath) {
-        console.log(`  [WARN] No image available for ${char.name}, skipping...`);
+        console.log(`  No image for ${char.name}, skipping`);
         continue;
       }
-      
-      console.log(`  [DEBUG] Final image path: ${imagePath}`);
 
-      // Preferir serie de MAL para hashtags (evita mezclar con otro anime cuando ACDB tiene serie equivocada)
       const seriesForTweet = (malChar?.anime?.[0]?.title) || char.series;
-
       posts.push({
         acdbId: char.id || null,
         character: {
@@ -471,93 +308,15 @@ export async function preparePostsWithImages(characters) {
         },
         imagePath
       });
-
     } catch (error) {
       console.error(`  Error preparing ${char.name}:`, error.message);
     }
-
-    // Rate limit
     await sleep(500);
   }
 
   return posts;
 }
 
-/**
- * Post a single birthday tweet
- * @param {object} postData - Post data with character and imagePath
- * @param {number} index - Post index for duplicate protection
- */
-async function postSingleBirthday(postData, index = null) {
-  try {
-    if (!postData.imagePath) {
-      // Placeholder (already posted or failed to prepare) – skip upload
-      if (index !== null && await isPostAlreadySent(index)) {
-        console.log(`Skipped (already posted): ${postData.character.name}`);
-        return { success: true, skipped: true, reason: 'already_posted' };
-      }
-      console.error(`No image for post index ${index}, skipping.`);
-      return { success: false, error: 'No image' };
-    }
-    const result = await postBirthdayTweet(postData.character, postData.imagePath, index);
-
-    if (result.skipped) {
-      console.log(`Skipped (already posted): ${postData.character.name}`);
-      return result;
-    }
-
-    if (result.success) {
-      console.log(`Posted: ${result.url}`);
-
-      // Clean up the image file
-      try {
-        await fs.unlink(postData.imagePath);
-      } catch (e) {
-        // Ignore cleanup errors
-      }
-    } else {
-      console.error(`Failed to post: ${result.error}`);
-    }
-
-    return result;
-  } catch (error) {
-    console.error('Error posting birthday:', error.message);
-    return { success: false, error: error.message };
-  }
-}
-
-/**
- * Prepare and post all immediately (for testing)
- */
-async function prepareAndPostAll() {
-  await preparePostsForToday();
-
-  if (todaysPosts.length === 0) {
-    console.log('No posts to make.');
-    return;
-  }
-
-  console.log(`\nPosting ${todaysPosts.length} birthday tweets...\n`);
-
-  for (let i = 0; i < todaysPosts.length; i++) {
-    const post = todaysPosts[i];
-    console.log(`[${i + 1}/${todaysPosts.length}] Posting ${post.character.name}...`);
-
-    await postSingleBirthday(post, i);
-
-    // Wait between posts to avoid rate limits
-    if (i < todaysPosts.length - 1) {
-      console.log('Waiting 30 seconds before next post...');
-      await sleep(30000);
-    }
-  }
-
-  console.log('\nAll posts complete!');
-}
-
-/**
- * Sanitize filename (exported for scripts)
- */
 export function sanitizeFilename(name) {
   return name
     .replace(/[<>:"/\\|?*]/g, '')
@@ -569,24 +328,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nShutting down...');
-  logUsageSummary();
-  process.exit(0);
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
 });
-
-process.on('SIGTERM', () => {
-  console.log('\nShutting down...');
-  logUsageSummary();
-  process.exit(0);
-});
-
-// Run main only when this file is executed directly (not when imported)
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
-if (isMain) {
-  main().catch(error => {
-    console.error('Fatal error:', error);
-    process.exit(1);
-  });
-}

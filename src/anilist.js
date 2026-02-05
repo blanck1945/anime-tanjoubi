@@ -44,8 +44,10 @@ export async function getCharacterImage(characterName, series) {
       }
     );
 
-    const characters = response.data?.data?.Page?.characters;
+    let characters = response.data?.data?.Page?.characters;
     if (!characters || characters.length === 0) return null;
+    // Orden estable por id para que siempre elijamos el mismo personaje entre varios
+    characters = [...characters].sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
 
     const seriesLower = (series || '').toLowerCase().replace(/\s+/g, ' ');
     const seriesWords = seriesLower.split(' ').filter(w => w.length > 1);

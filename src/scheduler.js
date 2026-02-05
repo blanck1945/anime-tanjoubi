@@ -3,18 +3,19 @@ import schedule from 'node-schedule';
 // Argentina timezone (UTC-3)
 const ARGENTINA_TZ = 'America/Argentina/Buenos_Aires';
 
-// Post times in Argentina time (24h format)
+// Post times in Argentina time (24h format) — cada 2 horas desde las 9
 export const POST_TIMES = [
-  { hour: 9, minute: 0 },   // 9:00 AM
-  { hour: 10, minute: 30 }, // 10:30 AM
-  { hour: 12, minute: 0 },  // 12:00 PM
-  { hour: 15, minute: 0 },  // 3:00 PM
-  { hour: 18, minute: 0 },  // 6:00 PM
-  { hour: 21, minute: 0 }   // 9:00 PM
+  { hour: 9, minute: 0 },   // 9:00
+  { hour: 11, minute: 0 },  // 11:00
+  { hour: 13, minute: 0 },  // 13:00
+  { hour: 15, minute: 0 },  // 15:00
+  { hour: 17, minute: 0 },  // 17:00
+  { hour: 19, minute: 0 },  // 19:00
+  { hour: 21, minute: 0 }   // 21:00
 ];
 
 // Time to prepare posts (run scraper and download images)
-const PREP_TIME = { hour: 8, minute: 30 }; // 8:30 AM Argentina
+export const PREP_TIME = { hour: 8, minute: 30 }; // 8:30 AM Argentina
 
 /**
  * Schedule the daily preparation job
