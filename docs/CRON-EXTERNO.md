@@ -21,6 +21,11 @@ Reemplazá `TU_CRON_SECRET` por el valor que configuraste en Railway como `CRON_
 
 **GET** `/` o **GET** `/health`: responde 200 OK (health check).
 
+**Preview (dashboard):** al abrir la URL de tu app en el navegador verás el dashboard. Rutas útiles:
+- **/** — página principal
+- **/planificado** — planificación por fecha (posts del día desde Supabase)
+- **/vista-previa** — vista previa de los posteos
+
 ## Horarios (Argentina = UTC−3)
 
 Configurá 8 cron jobs en cron-job.org (o similar). Horario en **UTC**:

@@ -2,8 +2,10 @@ import http from 'http';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { getCurrentState, loadState, canRecoverFromState, getAvailableDates } from './state.js';
+import { getDayDoc as getDayDocSupabase, getAvailableDates as getAvailableDatesSupabase } from './supabase.js';
 import { getScheduledJobs } from './scheduler.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -22,6 +24,30 @@ const DATA_DIR = process.env.RAILWAY_ENVIRONMENT
 
 const PORT = process.env.PORT || 3000;
 const ARGENTINA_TZ = 'America/Argentina/Buenos_Aires';
+const PROJECT_ROOT = path.join(__dirname, '..');
+
+async function getDatesForDashboard() {
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      return await getAvailableDatesSupabase(7);
+    } catch (e) {
+      return await getAvailableDates();
+    }
+  }
+  return await getAvailableDates();
+}
+
+async function getStateForDashboard(dateString) {
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const doc = await getDayDocSupabase(dateString);
+      return doc ? { date: doc.date, preparedAt: doc.preparedAt, posts: doc.posts || [] } : null;
+    } catch (e) {
+      return await loadState(dateString);
+    }
+  }
+  return await loadState(dateString);
+}
 
 /**
  * Indica si la hora programada ya pasó (según hora Argentina).
@@ -462,12 +488,76 @@ function escapeHtml(text) {
 /**
  * Start the HTTP server
  */
+function runCronAction(action, index) {
+  return new Promise((resolve, reject) => {
+    const args = action === 'prep' ? ['index.js', '--prep'] : ['index.js', `--post=${index}`];
+    const child = spawn(process.execPath, args, {
+      cwd: PROJECT_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (d) => { stdout += d.toString(); });
+    child.stderr?.on('data', (d) => { stderr += d.toString(); });
+    child.on('close', (code) => {
+      if (code === 0) resolve({ ok: true });
+      else reject(new Error(`exit ${code}: ${stderr || stdout}`));
+    });
+    child.on('error', reject);
+  });
+}
+
 export function startServer() {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Endpoint para cron externo (cron-job.org, etc.)
+    if (url.pathname === '/run' && req.method === 'GET') {
+      const token = url.searchParams.get('token');
+      const action = url.searchParams.get('action');
+      const CRON_SECRET = process.env.CRON_SECRET;
+      if (!CRON_SECRET || token !== CRON_SECRET) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+        return;
+      }
+      if (action === 'prep') {
+        try {
+          await runCronAction('prep');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, action: 'prep' }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, action: 'prep', error: err.message }));
+        }
+        return;
+      }
+      if (action === 'post') {
+        const indexStr = url.searchParams.get('index');
+        const index = indexStr != null ? parseInt(indexStr, 10) : NaN;
+        if (isNaN(index) || index < 0 || index > 6) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'index must be 0-6' }));
+          return;
+        }
+        try {
+          await runCronAction('post', index);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, action: 'post', index }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, action: 'post', index, error: err.message }));
+        }
+        return;
+      }
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'action must be prep or post' }));
+      return;
+    }
 
     if (url.pathname === '/api/status') {
       // JSON API endpoint
@@ -550,11 +640,11 @@ export function startServer() {
       }
     } else if (url.pathname === '/planificado') {
       try {
-        let dates = await getAvailableDates();
+        let dates = await getDatesForDashboard();
         const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
         if (dates.length === 0) dates = [today];
         const selectedDate = url.searchParams.get('date') || dates[0] || today;
-        const state = await loadState(selectedDate);
+        const state = await getStateForDashboard(selectedDate);
         const html = await generatePlanificadoPage(dates, selectedDate, state);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
@@ -564,11 +654,11 @@ export function startServer() {
       }
     } else if (url.pathname === '/vista-previa') {
       try {
-        let dates = await getAvailableDates();
+        let dates = await getDatesForDashboard();
         const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
         if (dates.length === 0) dates = [today];
         const selectedDate = url.searchParams.get('date') || dates[0] || today;
-        const state = await loadState(selectedDate);
+        const state = await getStateForDashboard(selectedDate);
         const html = await generateVistaPreviaPage(dates, selectedDate, state);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);

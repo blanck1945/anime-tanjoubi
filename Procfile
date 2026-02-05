@@ -1,1 +1,1 @@
-web: node cron-server.js
+web: node start-server.js
